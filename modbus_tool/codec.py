@@ -77,6 +77,21 @@ INTEGER_TYPES = {
     DataType.INT32, DataType.UINT64, DataType.INT64,
 }
 
+# 数据类型的中文显示名。core.meta() 的词汇表、界面「数据类型」下拉都从
+# 这里取 —— 以前 core 和 gui 各有一份，加一个类型要改两处还会漂移。
+# 顺序即 DataType 枚举序（ASCII 殿后），界面下拉的前 8 项下标依赖它。
+DTYPE_LABEL = {
+    DataType.UINT16: "无符号 16 位",
+    DataType.INT16: "有符号 16 位",
+    DataType.UINT32: "无符号 32 位",
+    DataType.INT32: "有符号 32 位",
+    DataType.FLOAT32: "单精度浮点",
+    DataType.UINT64: "无符号 64 位",
+    DataType.INT64: "有符号 64 位",
+    DataType.FLOAT64: "双精度浮点",
+    DataType.ASCII: "ASCII 字符",
+}
+
 
 def span(dtype: DataType | str) -> int:
     """该类型占用几个寄存器。"""

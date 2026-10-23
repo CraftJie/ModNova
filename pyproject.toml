@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modnova"
-description = "ModNova：主从一体、TCP / RTU 双模的轻量级 Modbus 调试工具（Tkinter 界面 + CLI）"
+description = "ModNova：主从一体、TCP / RTU / RTU over TCP 三模的轻量级 Modbus 调试工具（Tkinter 界面 + CLI）"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}

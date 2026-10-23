@@ -1,10 +1,11 @@
 # ModNova
 
-主从一体、TCP / RTU 双模的轻量级 Modbus 调试工具。界面是 Tkinter 单窗口桌面程序，
+主从一体、TCP / RTU / **RTU over TCP** 三模的轻量级 Modbus 调试工具。界面是 Tkinter 单窗口桌面程序，
 协议内核只用标准库 —— 只有 RTU 串口模式需要 `pyserial`。
 
 读到的寄存器能按 9 种数据类型（含 ASCII 字符串）× 4 种字节序解释，带缩放、单位和
-PLC 地址记法；每次收发的原始报文都能看到。这两件事决定了它能不能当日常主力工具用。
+PLC 地址记法；每次收发的原始报文都能看到，还能把任意一帧 hex 粘进「报文解析」逐字段拆开。
+这两件事决定了它能不能当日常主力工具用。
 
 ![](images/master.png)
 
@@ -20,11 +21,19 @@ PLC 地址记法；每次收发的原始报文都能看到。这两件事决定�
 | 06 | 写单寄存器 | ✅ | ✅ |
 | 0F | 写多线圈 | ✅ | ✅ |
 | 10 | 写多寄存器 | ✅ | ✅ |
+| 16 | 掩码写寄存器 | ✅ | ✅ |
 | 17 | 读写多寄存器 | 内核支持 | ✅ |
-| 2B | 读设备标识 | 内核支持（TCP / RTU） | ✅ |
+| 2B | 读设备标识 | ✅（工具条「识别」按钮） | ✅ |
+
+传输模式三种：**Modbus TCP**（MBAP）、**Modbus RTU**（串口，需 pyserial）、
+**RTU over TCP**（TCP 流里跑裸 RTU 帧 —— 串口服务器、DTU、4G 网关透传的常态，无需 pyserial）。
 
 异常码按规范生成与解析，主站收到异常会原样上报，不会当成「读到 0」。界面里把异常码
 翻成人话（「地址或数量超出从站范围」），不用去查表。
+
+从站页内置**故障注入**面板（丢包 / 延迟 / 异常码 / 截断 / 坏 CRC），给上位机的容错逻辑
+造对手；状态栏的「记录 CSV」把每轮读数落成 Excel 可开的表格；运行日志默认只在界面里，
+需要留档时用日志面板的「导出…」手动保存成文本文件。
 
 ## 数据类型与地址
 
@@ -82,8 +91,8 @@ PLC 地址记法；每次收发的原始报文都能看到。这两件事决定�
 - **就地改**：双击表格里的任意数值直接改，写的就是这个格子对应的地址，回车发出、
   Esc 取消；跨两个寄存器的类型改一格写整段。线圈双击是取反，只读区域会直接告诉你。
 - **从站改**：从站页双击「值」改模拟器内存，负数直接填。
-- **看变化**：轮询时值变化的行淡蓝高亮 900ms；点住任意一格，状态栏的迷你趋势条画这格
-  最近 120 次读数。统计（`成功 128 · 失败 3 · 0.8 ms`）常驻状态栏，失败数包含重试。
+- **看变化**：轮询时值变化的行淡蓝高亮 900ms。统计（`成功 128 · 失败 3 · 0.8 ms`）
+  常驻状态栏，失败数包含重试。
 - **链路状态**：顶栏是 `● 在线 · TCP 127.0.0.1:15020 · 站 1`；连续读失败变
   `● 无响应 N 次`，三次以上转 `● 链路中断`，读到一次自动回绿。
 - **模拟器**：从站页起一个 TCP / RTU 从站，主站连过来自测，全程不需要真实设备。
@@ -110,8 +119,11 @@ run_tk.bat                 # 双击启动（自动找一个带 tkinter 的解释
 python modnova.py          # 同上
 python modnova.py read --tcp 192.168.1.10 --fc 3 --addr 0 --count 4 \
     --type float32 --byteorder CDAB --unit-label ℃
+python modnova.py read --rtutcp 192.168.1.10:502 --fc 3 --addr 0 --count 4
 python modnova.py read --tcp 192.168.1.10 --fc 3 --addr 40001 --count 4 --plc
+python modnova.py write --tcp 192.168.1.10 --fc 22 --addr 0 --value 0xFFF0,0x000F
 python modnova.py serve --tcp 0.0.0.0:5020 --unit 1 --init 100,200,300
+python modnova.py serve --rtutcp 0.0.0.0:5020 --unit 1   # 透传模拟
 
 # 装了包之后也可以直接用命令名
 pip install -e ".[rtu]"
@@ -134,17 +146,19 @@ ModNova/
 │   ├── addressing.py         协议地址 ↔ PLC 地址，统一的地址解析/显示
 │   ├── parsing.py            用户输入解析（全角归一化、整数进制、写值切分）
 │   ├── datastore.py          从站四个寄存器区 + 数据源信号
-│   ├── transport.py          TCP(MBAP) / RTU(CRC) 链路，带报文探针
+│   ├── transport.py          TCP(MBAP) / RTU(CRC) / RTU over TCP 链路，带报文探针
 │   ├── client.py             主站
 │   ├── server.py             从站（协议核心 + 故障注入 + 设备标识）
 │   ├── core.py               应用层 API：字段视图、轮询任务、信号、故障、CSV、设备识别
 │   ├── view.py               字段级视图（偏移/类型/别名/单位）
 │   ├── config.py             配置持久化与预设
+│   ├── frameparser.py        报文解析器（粘贴一帧 hex 逐字段拆开）
+│   ├── applog.py             运行日志滚动落盘 + 崩溃堆栈
 │   ├── cli.py                命令行
 │   └── gui.py                Tkinter 界面
 ├── build/                    打包脚本（PyInstaller + 自签代码签名），产物不入库
 ├── pyproject.toml            打包元数据 + 可选依赖 [rtu]、lint/类型检查配置
-└── tests/                    184 项逻辑（unittest）+ 75 项界面 + 9 项 RTU（脚本）
+└── tests/                    273 项逻辑（unittest）+ 88 项界面 + 10 项 RTU（脚本）
 ```
 
 ## 分层
@@ -201,13 +215,14 @@ print(app.read(3, 0, 4, dtype="float32", byteorder="CDAB")["rows"])
 ```bash
 python tests/run_all.py          # 一条命令跑完三套（逻辑 + 界面 + RTU）
 
-python -m unittest discover -s tests -v        # 逻辑 184 项
-"<带 tkinter 的 python>" tests/ui_full_test.py  # 界面 75 项
-"<带 pyserial 的 python>" tests/rtu_full_test.py  # RTU 9 项（没有 pyserial 可用桩）
+python -m unittest discover -s tests -v        # 逻辑 273 项
+"<带 tkinter 的 python>" tests/ui_full_test.py  # 界面 88 项
+"<带 pyserial 的 python>" tests/rtu_full_test.py  # RTU 10 项（没有 pyserial 可用桩）
 ```
 
-逻辑测试分五个文件：协议、类型与地址、应用层（真起从站走完整链路）、新能力、
-回归（`test_regressions.py`，锁住每次审查修掉的具体缺陷）。界面测试按「用户会做的
+逻辑测试分六个文件：协议、类型与地址、应用层（真起从站走完整链路）、新能力、
+命令行（`test_cli.py`，参数解析与错误路径）、回归（`test_regressions.py`，
+锁住每次审查修掉的具体缺陷）。界面测试按「用户会做的
 每个动作」跑，每条用例同时断言界面文字、日志内容和从站内存里的真实值。
 
 ## 从源码打包成 exe
@@ -233,6 +248,13 @@ powershell -ExecutionPolicy Bypass -File build/sign.ps1 -Action create -Password
 powershell -ExecutionPolicy Bypass -File build/sign.ps1 -Action sign `
     -Password <口令> -Files build/dist/ModNova/ModNova.exe
 ```
+
+> ⚠️ **口令安全提醒**：口令与 `.pfx` 证书放在同一目录时，签名保护形同虚设 ——
+> 拿到证书和口令的人可以冒充你签发文件。建议至少做到其一：
+> ① 签发完成后删除 `certs/password.txt`，口令只留在凭据管理器/密码库里；
+> ② 不落盘，每次签名时手动输入 `-Password` 参数（注意它会进命令行历史，
+>   可用 `Read-Host -AsSecureString` 交互传入）。
+> `certs/password.txt` 只是早期便于复现构建留下的，脚本本身不依赖它。
 
 ## 常见问题
 

@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import math
+
 import tkinter as tk
 import tkinter.font as tkfont
 

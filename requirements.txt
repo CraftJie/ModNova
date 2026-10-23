@@ -1,6 +1,7 @@
-# TCP 模式完全不需要第三方库。
-# 只有 RTU（串口）模式才需要 pyserial：
+# TCP 模式完全不需要第三方库 —— 运行核心代码零依赖。
+# pyserial 仅 RTU（串口）模式需要，且是**可选依赖**，与 pyproject.toml
+# 的 [rtu] extra 对应。需要 RTU 时二选一安装：
 #     pip install pyserial
-# 装了包之后也可以用可选依赖：
 #     pip install -e ".[rtu]"
-pyserial>=3.5
+# 注意：本文件里不写 pyserial，避免 `pip install -r requirements.txt`
+# 把可选依赖变成强制依赖（纯 TCP 用户不必装串口库）。

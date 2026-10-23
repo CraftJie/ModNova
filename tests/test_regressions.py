@@ -8,10 +8,13 @@
 
 from __future__ import annotations
 
+import json
 import os
+import socket
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -28,23 +31,31 @@ from modbus_tool.codec import (
     patch_ascii,
     span,
 )
+from modbus_tool.config import Config
 from modbus_tool.core import ModbusCore
 from modbus_tool.datastore import DataStore
-from modbus_tool.parsing import normalize_number, parse_int, parse_write_values
+from modbus_tool.parsing import (
+    normalize_number,
+    parse_int,
+    parse_write_values,
+    split_values,
+)
 from modbus_tool.pdu import (
     ExceptionCode,
     FC,
     ModbusError,
     ParameterError,
     Request,
+    build_device_id_response,
     pack_request,
     pack_response,
+    parse_device_id_response,
     read_limit,
     unpack_response,
     write_limit,
 )
 from modbus_tool.server import FaultConfig, ModbusServer, TcpServer
-from modbus_tool.transport import TcpTransport
+from modbus_tool.transport import TcpTransport, TransportError
 from modbus_tool.view import Field, parse_fields
 
 
@@ -354,6 +365,314 @@ class TestFormatHelpers(unittest.TestCase):
         from modbus_tool.pdu import Response
         with self.assertRaises(ValueError):
             pack_response(Response(FC.READ_HOLDING_REGISTERS, [0] * 200))
+
+
+class TestHalfFrameTimeout(unittest.TestCase):
+    """P0-1：TCP 半帧超时后必须断链，否则残字节让后续响应全部错位。"""
+
+    def setUp(self):
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(1)
+        self.port = self.server.getsockname()[1]
+        self.conn = None
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        try:
+            conn, _ = self.server.accept()
+            self.conn = conn
+            # 只发 4 字节 MBAP 头的前半截，然后装死 —— 模拟弱网断流
+            conn.sendall(b"\x00\x01\x00\x00")
+        except OSError:
+            pass
+
+    def tearDown(self):
+        if self.conn is not None:
+            self.conn.close()
+        self.server.close()
+
+    def test_half_frame_timeout_closes_link(self):
+        t = TcpTransport("127.0.0.1", self.port, timeout=0.3)
+        t.open()
+        time.sleep(0.2)          # 等对端把半帧发出来
+        with self.assertRaises(TimeoutError):
+            t.recv()
+        # 修之前：socket 保持打开，残字节留在流里，下一个响应对不上号；
+        # 修之后：半帧超时主动断链，上层重连逻辑从干净的字节流开始
+        self.assertFalse(t.connected)
+
+
+class TestEmptyHostFallback(unittest.TestCase):
+    """P0-2：监听地址留空一律回退 127.0.0.1，绝不静默绑 0.0.0.0。"""
+
+    def test_tcp_server_default_is_loopback(self):
+        srv = TcpServer(port=0)          # 不传 host，走默认值
+        srv.start()
+        try:
+            self.assertEqual(srv._sock.getsockname()[0], "127.0.0.1")
+        finally:
+            srv.stop()
+
+    def test_core_slave_start_empty_host_is_loopback(self):
+        cfg_dir = tempfile.mkdtemp()
+        core = ModbusCore(config_path=os.path.join(cfg_dir, "config.json"))
+        try:
+            core.slave_start({"mode": "tcp", "host": "", "port": 0})
+            self.assertEqual(core.slave.host, "127.0.0.1")
+        finally:
+            core.slave_stop()
+
+    def test_cli_endpoint_empty_host_is_loopback(self):
+        from modbus_tool.cli import _parse_endpoint
+        self.assertEqual(_parse_endpoint(":5020", 502), ("127.0.0.1", 5020))
+        self.assertEqual(_parse_endpoint("0.0.0.0:5020", 502), ("0.0.0.0", 5020))
+
+
+class TestServerKeepalive(unittest.TestCase):
+    """P1-4：接受的连接必须开 SO_KEEPALIVE，半开连接不能永久占槽。"""
+
+    def test_accepted_connection_sets_keepalive(self):
+        srv = TcpServer(port=0)
+        srv.start()
+        cli = socket.create_connection(("127.0.0.1", srv.port), timeout=2)
+        try:
+            time.sleep(0.5)      # 等 accept 线程完成设置
+            flags = [c.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+                     for c in list(srv._clients)]
+            self.assertTrue(flags)
+            self.assertTrue(all(flags))
+        finally:
+            cli.close()
+            srv.stop()
+
+
+class TestDeviceIdBudget(unittest.TestCase):
+    """P1-5：设备标识响应整体不得超过 PDU 253 字节，且必须可解析。"""
+
+    def test_long_identity_stays_within_pdu_limit(self):
+        identity = {i: "X" * 250 for i in range(7)}
+        for code in (1, 2, 3):
+            pdu = build_device_id_response(identity, code)
+            self.assertLessEqual(len(pdu), 253)
+            info = parse_device_id_response(pdu)      # 超限帧自己客户端都收不了
+            self.assertTrue(info)
+
+    def test_normal_identity_intact(self):
+        identity = {0: "ModNova", 1: "SIM", 2: "V1.4.0"}
+        for code in (1, 2, 3):
+            pdu = build_device_id_response(identity, code)
+            self.assertEqual(parse_device_id_response(pdu), identity)
+
+
+class TestProbeThreadSafety(unittest.TestCase):
+    """P1-6：probe 换站号全程持锁，既不死锁也不把并发请求发到错站。"""
+
+    def test_probe_restores_unit_and_never_deadlocks(self):
+        class StubTransport:
+            label = "stub"
+
+            def __init__(self):
+                self.closed = False
+
+            @property
+            def connected(self):
+                return False
+
+            def open(self):
+                raise TransportError("连不上")
+
+            def close(self):
+                self.closed = True
+
+            def send(self, unit, pdu):
+                raise TransportError("not connected")
+
+            def recv(self):
+                raise TransportError("not connected")
+
+            def set_tap(self, callback):
+                pass
+
+        client = ModbusClient(StubTransport(), 1, retries=0)
+        self.assertFalse(client.probe(5))    # 修之前这里会死锁（Lock 不可重入）
+        self.assertEqual(client.unit, 1)     # 站号必须被还原
+
+
+class TestFC23Atomic(unittest.TestCase):
+    """P1-7：FC23 先写后读必须在一个锁周期内完成。"""
+
+    def test_read_sees_own_write_when_ranges_overlap(self):
+        store = DataStore(size=100)
+        store.write_holding_registers(8, [111, 222, 0])
+        # 写 [10..11]，读 [8..13]：读区包含刚写的格子，必须看到新值
+        result = store.rw_holding_registers(10, [7, 7], 8, 6)
+        self.assertEqual(result, [111, 222, 7, 7, 0, 0])
+
+    def test_out_of_range_write_rejected_before_read(self):
+        store = DataStore(size=100)
+        with self.assertRaises(ModbusError):
+            store.rw_holding_registers(99, [1, 2], 0, 1)
+
+
+class TestResponseQuantityExact(unittest.TestCase):
+    """P2-10：读寄存器应答数量必须精确相等，多给少给都拒收。"""
+
+    def test_extra_registers_rejected(self):
+        request = Request(FC.READ_HOLDING_REGISTERS, 0, 2)
+        pdu = bytes([FC.READ_HOLDING_REGISTERS, 6]) + struct.pack(">3H", 1, 2, 3)
+        with self.assertRaises(ModbusError):
+            unpack_response(pdu, request)
+
+    def test_short_response_still_rejected(self):
+        request = Request(FC.READ_HOLDING_REGISTERS, 0, 2)
+        pdu = bytes([FC.READ_HOLDING_REGISTERS, 2]) + struct.pack(">H", 1)
+        with self.assertRaises(ModbusError):
+            unpack_response(pdu, request)
+
+    def test_exact_response_accepted(self):
+        request = Request(FC.READ_HOLDING_REGISTERS, 0, 2)
+        pdu = bytes([FC.READ_HOLDING_REGISTERS, 4]) + struct.pack(">2H", 1, 2)
+        self.assertEqual(unpack_response(pdu, request).values, [1, 2])
+
+    def test_fc23_extra_registers_rejected(self):
+        request = Request(FC.READ_WRITE_MULTIPLE_REGISTERS, 0, 2,
+                          [1], write_address=0)
+        pdu = bytes([FC.READ_WRITE_MULTIPLE_REGISTERS, 6]) + struct.pack(">3H", 1, 2, 3)
+        with self.assertRaises(ModbusError):
+            unpack_response(pdu, request)
+
+
+class TestConfigSaveConcurrency(unittest.TestCase):
+    """P2-11：多线程并发保存，配置文件必须始终是合法 JSON。"""
+
+    def test_concurrent_save_keeps_file_valid(self):
+        path = os.path.join(tempfile.mkdtemp(), "config.json")
+        cfg = Config(path)
+        errors = []
+
+        def worker(n):
+            try:
+                for i in range(15):
+                    cfg.data["view"]["count"] = n * 1000 + i
+                    cfg.save()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(15)
+        self.assertEqual(errors, [])
+        with open(path, encoding="utf-8") as handle:
+            json.load(handle)
+
+
+class TestSeparatorConsistency(unittest.TestCase):
+    """P2-8：工具条提示与真实解析必须同口径 —— 顿号、半角分号都算分隔符。"""
+
+    def test_split_values_accepts_all_separators(self):
+        self.assertEqual(split_values("1、2；3，4;5,6"),
+                         ["1", "2", "3", "4", "5", "6"])
+
+
+class _LoopbackTransport:
+    """发出去的 PDU 原样收回 —— 让 client.write 能走完整校验链而不碰网络。"""
+
+    label = "loopback"
+
+    def __init__(self) -> None:
+        self.connected = True
+        self.sent: bytes = b""
+
+    def open(self) -> None: ...
+    def close(self) -> None: ...
+
+    def send(self, unit: int, pdu: bytes) -> None:
+        self.sent = pdu
+
+    def recv(self) -> tuple[int, bytes]:
+        return 1, self.sent
+
+
+class TestWriteEchoAddress(unittest.TestCase):
+    """2026-10-24 L-3：FC05/06 响应地址回显不符要报错（此前只有 FC22 校验）。"""
+
+    def test_register_echo_mismatch_rejected(self):
+        request = Request(FC.WRITE_SINGLE_REGISTER, 7, 1, [123])
+        with self.assertRaises(ModbusError):
+            unpack_response(struct.pack(">BHH", 6, 8, 123), request)
+
+    def test_coil_echo_mismatch_rejected(self):
+        request = Request(FC.WRITE_SINGLE_COIL, 3, 1, [1])
+        with self.assertRaises(ModbusError):
+            unpack_response(struct.pack(">BHH", 5, 4, 0xFF00), request)
+
+    def test_echo_ok_passes(self):
+        resp = unpack_response(struct.pack(">BHH", 6, 7, 123),
+                               Request(FC.WRITE_SINGLE_REGISTER, 7, 1, [123]))
+        self.assertEqual((resp.address, resp.values), (7, [123]))
+
+    def test_end_to_end_mismatch_surfaces_via_client(self):
+        # 环回链路上把回显地址改错，client.write 必须把它当失败而不是照单全收
+        transport = _LoopbackTransport()
+
+        original_recv = transport.recv
+
+        def corrupt_echo():
+            unit, pdu = original_recv()
+            return unit, struct.pack(">BHH", pdu[0], pdu[1] + 1,  # 地址 +1
+                                     int.from_bytes(pdu[3:5], "big"))
+
+        client = ModbusClient(transport, unit=1, retries=0)
+        client.transport.recv = corrupt_echo  # type: ignore[method-assign]
+        with self.assertRaises(ModbusError):
+            client.write(6, 7, [123])
+
+
+class TestClientWriteRejectsFractional(unittest.TestCase):
+    """2026-10-24 L-4：client.write 对 220.5 这类值曾静默 int() 截断成 220。"""
+
+    def setUp(self):
+        self.client = ModbusClient(_LoopbackTransport(), unit=1, retries=0)
+
+    def test_fractional_single_register_rejected(self):
+        with self.assertRaises(ValueError):
+            self.client.write(6, 0, [1.5])
+
+    def test_fractional_multi_register_rejected(self):
+        with self.assertRaises(ValueError):
+            self.client.write(16, 0, [100, 220.5])
+
+    def test_fractional_mask_rejected(self):
+        with self.assertRaises(ValueError):
+            self.client.write(22, 0, [0.5, 0x000F])
+
+    def test_integral_float_and_bool_accepted(self):
+        resp = self.client.write(6, 7, [5.0])
+        self.assertEqual(resp.values, [5])
+        resp = self.client.write(6, 7, [True])
+        self.assertEqual(resp.values, [1])
+
+
+class TestCoreStateZeroLatency(unittest.TestCase):
+    """2026-10-24 L-7：0.0ms 是合法读数，truthiness 判断会把它丢成 None。"""
+
+    def test_zero_latency_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ModbusCore(os.path.join(tmp, "cfg.json"))
+            try:
+                dummy = ModbusClient(_LoopbackTransport(), unit=1)
+                dummy.request_count = 3
+                dummy.error_count = 0
+                dummy.last_latency_ms = 0.0
+                app.client = dummy
+                state = app.state()
+                self.assertEqual(state["stats"]["latency"], 0.0)
+            finally:
+                app.client = None
+                app.shutdown()
 
 
 if __name__ == "__main__":

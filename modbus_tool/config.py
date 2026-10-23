@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -72,6 +73,8 @@ def _merge(base: dict, override: dict) -> dict:
 class Config:
     def __init__(self, path: str | os.PathLike | None = None) -> None:
         self.path = Path(path) if path else default_path()
+        # 界面线程和轮询任务线程都可能触发 save（改预设、断开时回写链路参数）
+        self._save_lock = threading.Lock()
         self.data = self._load()
 
     # -- 读写 --------------------------------------------------------------
@@ -95,13 +98,17 @@ class Config:
             return copy.deepcopy(DEFAULT_CONFIG)
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(self.data, handle, ensure_ascii=False, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, self.path)
+        with self._save_lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # 临时文件名带 pid + 线程号：固定 .tmp 的话，两个线程并发保存
+            # 会互相覆盖半截文件，os.replace 搬过去的就是坏配置
+            tmp = self.path.with_suffix(
+                f"{self.path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(self.data, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.path)
 
     # -- 字段 --------------------------------------------------------------
 

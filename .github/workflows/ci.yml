@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  logic:
+    name: Logic tests (py${{ matrix.python }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run logic suite
+        run: python -m unittest discover -s tests -v
+
+  ui-rtu:
+    name: UI + RTU tests (Windows, Tk)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pyserial
+        run: pip install pyserial
+      - name: Run UI suite
+        run: python tests/ui_full_test.py
+      - name: Run RTU suite
+        run: python tests/rtu_full_test.py
+
+  lint:
+    name: Lint & type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff & mypy
+        run: pip install ruff mypy
+      - name: Ruff
+        run: ruff check modbus_tool
+      - name: Mypy
+        run: mypy modbus_tool

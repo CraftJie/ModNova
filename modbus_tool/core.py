@@ -21,6 +21,7 @@ from pathlib import Path
 from .addressing import AREA_LABEL, display_address, resolve_address
 from .client import ModbusClient
 from .codec import (
+    DTYPE_LABEL,
     ByteOrder,
     DataType,
     bin_of,
@@ -32,29 +33,18 @@ from .codec import (
     span,
 )
 from .config import Config
-from .datastore import SIGNAL_LABEL, SIGNAL_MODES, DataStore
+from .datastore import BIT_AREAS, SIGNAL_LABEL, SIGNAL_MODES, DataStore
 from .pdu import DEVICE_ID_OBJECTS, describe_error
-from .server import FaultConfig, RtuServer, TcpServer
-from .transport import HAS_SERIAL, RtuTransport, TcpTransport, list_serial_ports
+from .server import FaultConfig, RtuOverTcpServer, RtuServer, TcpServer
+from .transport import HAS_SERIAL, RtuOverTcpTransport, RtuTransport, TcpTransport, list_serial_ports
 
 # 版本号只有一个来源（包根的 __version__）。以前 core.meta() 写死 "1.2.1"、
 # 包根是 1.4.0、从站对 FC2B 报 "V1.3"，三处各说各话。
 from . import __version__ as _VERSION
 from .view import Field, decode_fields, parse_fields, total_span, validate_fields
 
-# 数据类型下拉的显示名。和界面无关，属于这一层的词汇表。
-DTYPE_LABEL = {
-    DataType.UINT16: "无符号 16 位",
-    DataType.INT16: "有符号 16 位",
-    DataType.UINT32: "无符号 32 位",
-    DataType.INT32: "有符号 32 位",
-    DataType.FLOAT32: "单精度浮点",
-    DataType.UINT64: "无符号 64 位",
-    DataType.INT64: "有符号 64 位",
-    DataType.FLOAT64: "双精度浮点",
-}
-
-BIT_AREAS = ("coils", "discrete_inputs")
+# 数据类型下拉的显示名收敛到 codec.DTYPE_LABEL（导入即 re-export，
+# `core.DTYPE_LABEL` 对外仍然可用）。
 
 
 
@@ -175,6 +165,9 @@ class ModbusCore:
         if mode == "tcp":
             transport = TcpTransport(cfg.get("host") or "127.0.0.1",
                                      int(cfg.get("port", 502)), timeout=timeout)
+        elif mode == "rtutcp":
+            transport = RtuOverTcpTransport(cfg.get("host") or "127.0.0.1",
+                                            int(cfg.get("port", 502)), timeout=timeout)
         else:
             if not HAS_SERIAL:
                 raise RuntimeError("RTU 模式需要 pyserial")
@@ -319,6 +312,11 @@ class ModbusCore:
 
         if fc in (5, 15):
             payload = [bool(v) for v in values]
+        elif fc == 22:
+            # 掩码写的值是位掩码不是物理量，不走 dtype 编码
+            if len(values) != 2:
+                raise ValueError("掩码写需要 AND 和 OR 两个掩码")
+            payload = [int(v) & 0xFFFF for v in values]
         else:
             # 用户按物理量填（比如 220.5），这里负责编码成寄存器序列
             payload = encode(values, dtype, byteorder, scale, bias)
@@ -491,9 +489,12 @@ class ModbusCore:
         identity = {int(k): str(v)
                     for k, v in (cfg.get("identity") or {}).items()} or None
         mode = cfg.get("mode", "tcp")
-        if mode == "tcp":
-            server = TcpServer(
-                host=cfg.get("host") or "0.0.0.0",
+        if mode in ("tcp", "rtutcp"):
+            # rtutcp：TCP 监听但流里跑裸 RTU 帧，模拟串口服务器/DTU 背后的设备
+            server_cls = TcpServer if mode == "tcp" else RtuOverTcpServer
+            server = server_cls(
+                # 空地址回退 127.0.0.1 而不是 0.0.0.0：要暴露到网段必须显式填
+                host=cfg.get("host") or "127.0.0.1",
                 port=int(cfg.get("port", 5020)),
                 store=store,
                 unit=int(cfg.get("unit", 1)),
@@ -676,8 +677,10 @@ class ModbusCore:
                 stats = {
                     "requests": self.client.request_count,
                     "errors": self.client.error_count,
+                    # 延迟必须用 is not None 判：0.0ms 是合法读数（本地回环极快时），
+                    # truthiness 判断会把它丢成 None，和 gui._refresh_stats 口径一致
                     "latency": (round(self.client.last_latency_ms, 1)
-                                if self.client.last_latency_ms else None),
+                                if self.client.last_latency_ms is not None else None),
                 }
             return {"link": dict(self.link_info), "stats": stats, "slave": self.slave_status()}
 

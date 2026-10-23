@@ -28,6 +28,25 @@ from .pdu import (
 from .transport import READ_LIKE_FC, Transport, TransportError
 
 
+def _as_register_int(value) -> int:
+    """寄存器值必须是整数。
+
+    GUI / CLI / core 三条路径都先经 codec.encode 编码成整数寄存器序列，
+    这里拦的是绕过编码直接调 API 的用法：`int(220.5)` 会静默截断成 220，
+    等于把错的数据悄悄写到设备上 —— 宁可报错，也不要静默写错半个字。
+    整数值的 float（5.0）放行，bool 按 0/1 处理。
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    raise ValueError(
+        f"寄存器值必须是整数，收到 {value!r}；"
+        "物理量请先用 codec.encode 编码成寄存器序列")
+
+
 class ModbusClient:
     def __init__(
         self,
@@ -40,7 +59,11 @@ class ModbusClient:
         self.unit = int(unit)
         self.retries = max(0, int(retries))
         self.on_log = on_log
-        self._lock = threading.Lock()
+        # RLock：probe 需要持锁改站号，而 probe 内部的请求又要走 _exchange 的锁
+        self._lock = threading.RLock()
+        # 计数器有独立的锁：成功路径的累加发生在传输锁之外，
+        # 两个线程同时成功时 `+=` 在字节码层面不是原子的
+        self._stat_lock = threading.Lock()
         self.request_count = 0
         self.error_count = 0
         self.last_latency_ms: float | None = None
@@ -50,6 +73,10 @@ class ModbusClient:
     def _log(self, text: str) -> None:
         if self.on_log:
             self.on_log(text)
+
+    def _bump(self, name: str, n: int = 1) -> None:
+        with self._stat_lock:
+            setattr(self, name, getattr(self, name) + n)
 
     def _exchange(self, pdu: bytes) -> bytes:
         """发一帧收一帧，带重试和站号校验，返回原始响应 PDU。"""
@@ -71,16 +98,16 @@ class ModbusClient:
                         f"响应的站地址 {unit_id} 与请求的 {self.unit} 不符"
                     )
                 self.last_latency_ms = (time.perf_counter() - started) * 1000
-                self.request_count += 1
+                self._bump("request_count")
                 return response_pdu
             except ModbusError:
                 # 从站的明确答复，不重试，直接上报
-                self.request_count += 1
-                self.error_count += 1
+                self._bump("request_count")
+                self._bump("error_count")
                 raise
             except (TimeoutError, TransportError) as exc:
                 last_error = exc
-                self.error_count += 1
+                self._bump("error_count")
                 if attempts_left > 0:
                     self._log(f"第 {self.retries - attempts_left + 1} 次尝试失败（{exc}），重试中")
                     continue
@@ -104,7 +131,7 @@ class ModbusClient:
         try:
             return unpack_response(pdu, request)
         except ModbusError:
-            self.error_count += 1
+            self._bump("error_count")
             raise
 
     def read_device_id(self, code: int = 1, object_id: int = 0) -> dict[int, str]:
@@ -115,7 +142,7 @@ class ModbusClient:
         """
         response = self._exchange(build_device_id_request(code, object_id))
         if response and response[0] & 0x80:
-            self.error_count += 1
+            self._bump("error_count")
             raise ModbusError(response[1], "从站拒绝读设备标识")
         return parse_device_id_response(response)
 
@@ -151,6 +178,11 @@ class ModbusClient:
     # -- 写 ----------------------------------------------------------------
 
     def write(self, function: int, address: int, values: list) -> Response:
+        """写操作。values 必须是寄存器整数序列（线圈为布尔）——
+
+        物理量（220.5 ℃、float32）请先经 codec.encode 编码；这里对
+        带小数的值直接报错而不是静默截断（见 _as_register_int）。
+        """
         fc = int(function)
         if fc in (FC.WRITE_SINGLE_COIL, FC.WRITE_SINGLE_REGISTER):
             if len(values) != 1:
@@ -158,12 +190,18 @@ class ModbusClient:
             if fc == FC.WRITE_SINGLE_COIL:
                 values = [bool(values[0])]
             else:
-                values = [int(values[0])]
+                values = [_as_register_int(values[0])]
             request = Request(fc, address, 1, list(values))
         elif fc == FC.WRITE_MULTIPLE_COILS:
             request = Request(fc, address, len(values), [bool(v) for v in values])
         elif fc == FC.WRITE_MULTIPLE_REGISTERS:
-            request = Request(fc, address, len(values), [int(v) for v in values])
+            request = Request(fc, address, len(values),
+                              [_as_register_int(v) for v in values])
+        elif fc == FC.MASK_WRITE:
+            if len(values) != 2:
+                raise ValueError("掩码写需要 AND 和 OR 两个掩码")
+            request = Request(fc, address, 0,
+                              [_as_register_int(values[0]), _as_register_int(values[1])])
         else:
             raise ValueError(f"功能码 0x{fc:02X} 不是写操作")
 
@@ -183,6 +221,14 @@ class ModbusClient:
     def write_registers(self, address: int, values: list[int]) -> Response:
         return self.write(FC.WRITE_MULTIPLE_REGISTERS, address, values)
 
+    def mask_write(self, address: int, and_mask: int, or_mask: int) -> Response:
+        """FC22 掩码写：只改一个寄存器的某几位，不惊动其他位。
+
+        and_mask 为 1 的位保留原值，为 0 的位被 or_mask 的对应位覆盖。
+        例：把低 4 位置 1 而其余位不动 → mask_write(addr, 0xFFF0, 0x000F)。
+        """
+        return self.write(FC.MASK_WRITE, address, [and_mask, or_mask])
+
     # -- 杂项 --------------------------------------------------------------
 
     def probe(self, unit: int | None = None) -> bool:
@@ -193,21 +239,25 @@ class ModbusClient:
         但这个值可能是**上一次成功请求**留下的 —— 从站已经下线，probe
         仍然返回 True。这种「靠调用方记得清理」的接口迟早出错
         （cmd_scan 恰好在外层清了，所以一直没暴露）。
+
+        换站号的整个过程持锁：probe 中途若有并发请求进来，会把读请求
+        发到刚被改掉的站号上（RLock 允许内部的 _exchange 重入同一把锁）。
         """
-        original = self.unit
-        if unit is not None:
-            self.unit = int(unit)
-        self.last_latency_ms = None
-        try:
-            self.read_holding_registers(0, 1)
-            return True
-        except ModbusError:
-            # 从站回了一个明确的异常码：它活着，而且在说话
-            return True
-        except (TimeoutError, TransportError):
-            return False
-        finally:
-            self.unit = original
+        with self._lock:
+            original = self.unit
+            if unit is not None:
+                self.unit = int(unit)
+            self.last_latency_ms = None
+            try:
+                self.read_holding_registers(0, 1)
+                return True
+            except ModbusError:
+                # 从站回了一个明确的异常码：它活着，而且在说话
+                return True
+            except (TimeoutError, TransportError):
+                return False
+            finally:
+                self.unit = original
 
     @staticmethod
     def _format_values(values: list) -> str:

@@ -214,6 +214,38 @@ def main() -> int:
 
     case("RTU 未知功能码后重同步", "丢帧后仍能正常读", unknown_function_resync)
 
+    def serial_exception_breaks_loop():
+        """2026-10-24 M-4：串口拔出时从站线程必须记日志退出，而非带 traceback 静默死亡。
+
+        以前 _read_request 只捕 TransportError，pyserial 的 SerialException
+        （OSError 子类）会穿透 _loop —— 线程死掉、running 标志由 finally 清掉，
+        但没有任何日志，界面还显示「运行中」。
+        """
+        logs: list[str] = []
+        victim = RtuServer(port="FAKE-BOOM", store=DataStore(size=8), unit=1,
+                           on_log=logs.append)
+
+        class BoomSerial:
+            is_open = True
+
+            def read(self, size: int) -> bytes:
+                raise OSError("device removed (fake)")   # SerialException 的基类
+
+            def write(self, data: bytes) -> int:
+                raise AssertionError("不应走到写")
+
+            def flush(self) -> None:
+                pass
+
+        victim._ser = BoomSerial()
+        victim._running.set()
+        victim._loop()                     # 当前线程直接跑一轮，read 即抛
+        stopped = not victim.running
+        logged = any("串口" in text for text in logs)
+        return f"已停止={stopped} 日志={logs}", stopped and logged
+
+    case("RTU 串口异常收口", "记日志并退出线程", serial_exception_breaks_loop)
+
     client.close()
     server.stop()
 

@@ -25,6 +25,7 @@ class FC(IntEnum):
     WRITE_SINGLE_REGISTER = 0x06
     WRITE_MULTIPLE_COILS = 0x0F
     WRITE_MULTIPLE_REGISTERS = 0x10
+    MASK_WRITE = 0x16
     READ_WRITE_MULTIPLE_REGISTERS = 0x17
     READ_DEVICE_IDENTIFICATION = 0x2B
 
@@ -249,6 +250,11 @@ def describe_write_frame(frame: bytes) -> str:
         if data_bytes != count * 2:
             line += f" ⚠ 字节数应为 {count * 2}，报文结构可疑"
         return line
+    if fc == 0x16 and len(pdu) >= 7:
+        and_mask = int.from_bytes(pdu[3:5], "big")
+        or_mask = int.from_bytes(pdu[5:7], "big")
+        return (f"FC22 掩码写 · 地址 {address} · "
+                f"AND 0x{and_mask:04X} OR 0x{or_mask:04X}")
     if fc == 0x0F and len(pdu) >= 7:
         count = int.from_bytes(pdu[3:5], "big")
         return f"FC15 写多线圈 · 数量 {count} 个线圈（{pdu[5]} 字节）· 起始 {address}"
@@ -310,6 +316,19 @@ def pack_request(req: Request) -> bytes:
         payload = _pack_regs(req.values)
         return struct.pack(">BHHB", fc, req.address, len(req.values), len(payload)) + payload
 
+    if fc == FC.MASK_WRITE:
+        # FC22 掩码写：values 是 [AND 掩码, OR 掩码]，只动一个寄存器的某几位。
+        # 结果 = (当前值 AND and_mask) OR (or_mask AND NOT and_mask)。
+        _check_address(req.address)
+        if len(req.values) != 2:
+            raise ParameterError(ExceptionCode.ILLEGAL_DATA_VALUE,
+                                 "掩码写需要 AND 和 OR 两个掩码")
+        for name, mask in zip(("AND", "OR"), req.values):
+            if not 0 <= int(mask) <= 0xFFFF:
+                raise ParameterError(ExceptionCode.ILLEGAL_DATA_VALUE,
+                                     f"{name} 掩码 {mask} 超出 0~65535")
+        return struct.pack(">BHHH", fc, req.address, int(req.values[0]), int(req.values[1]))
+
     if fc == FC.READ_WRITE_MULTIPLE_REGISTERS:
         _check_address(req.address)
         _check_address(req.write_address)
@@ -356,6 +375,12 @@ def unpack_request(pdu: bytes) -> Request:
         if byte_count != count * 2 or len(body) != byte_count:
             raise ModbusError(ExceptionCode.ILLEGAL_DATA_VALUE, "字节数与数量不符")
         return Request(fc, address, count, _unpack_regs(body))
+
+    if fc == FC.MASK_WRITE:
+        if len(pdu) != 7:
+            raise ModbusError(ExceptionCode.ILLEGAL_DATA_VALUE, "掩码写请求应为 7 字节")
+        _, address, and_mask, or_mask = struct.unpack(">BHHH", pdu)
+        return Request(fc, address, 0, [and_mask, or_mask])
 
     if fc == FC.READ_WRITE_MULTIPLE_REGISTERS:
         if len(pdu) < 10:
@@ -417,6 +442,9 @@ def pack_response(resp: Response) -> bytes:
     if fc in (FC.WRITE_MULTIPLE_COILS, FC.WRITE_MULTIPLE_REGISTERS):
         return struct.pack(">BHH", fc, resp.address, resp.count)
 
+    if fc == FC.MASK_WRITE:
+        return struct.pack(">BHHH", fc, resp.address, int(resp.values[0]), int(resp.values[1]))
+
     if fc == FC.READ_WRITE_MULTIPLE_REGISTERS:
         return _counted(fc, _pack_regs(resp.values))
 
@@ -457,16 +485,23 @@ def unpack_response(pdu: bytes, request: Request) -> Response:
         body = pdu[2:]
         if len(body) != byte_count or byte_count % 2:
             raise ModbusError(ExceptionCode.SERVER_DEVICE_FAILURE, "字节数字段与实际长度不符")
-        if request.count and byte_count < request.count * 2:
+        # 数量必须**精确相等**。只校验「够不够」的话，从站多给的数据会被
+        # 照单全收并返回超量寄存器（规范说这是不合规响应），而且多出来的
+        # 字节往往意味着流已经错位，越早报错越好。
+        if request.count and byte_count != request.count * 2:
             raise ModbusError(
                 ExceptionCode.SERVER_DEVICE_FAILURE,
-                f"寄存器应答只有 {byte_count // 2} 个，请求了 {request.count} 个")
+                f"寄存器应答 {byte_count // 2} 个，请求了 {request.count} 个")
         return Response(fc, _unpack_regs(body))
 
     if fc in WRITE_SINGLE_FC:
         if len(pdu) != 5:
             raise ModbusError(ExceptionCode.SERVER_DEVICE_FAILURE, "响应长度错误")
         _, address, value = struct.unpack(">BHH", pdu)
+        # 地址回显必须与请求一致 —— 规范要求原样回显，不一致说明流错位或
+        # 从站行为异常。此前只有 MASK_WRITE 分支做了校验，FC05/06 漏了。
+        if address != request.address:
+            raise ModbusError(ExceptionCode.SERVER_DEVICE_FAILURE, "写回显地址不符")
         return Response(fc, [value], address, 1)
 
     if fc in (FC.WRITE_MULTIPLE_COILS, FC.WRITE_MULTIPLE_REGISTERS):
@@ -477,15 +512,24 @@ def unpack_response(pdu: bytes, request: Request) -> Response:
             raise ModbusError(ExceptionCode.SERVER_DEVICE_FAILURE, "写回显数量不符")
         return Response(fc, [], address, count)
 
+    if fc == FC.MASK_WRITE:
+        if len(pdu) != 7:
+            raise ModbusError(ExceptionCode.SERVER_DEVICE_FAILURE, "响应长度错误")
+        _, address, and_mask, or_mask = struct.unpack(">BHHH", pdu)
+        if request.values and address != request.address:
+            raise ModbusError(ExceptionCode.SERVER_DEVICE_FAILURE, "写回显地址不符")
+        return Response(fc, [and_mask, or_mask], address, 0)
+
     if fc == FC.READ_WRITE_MULTIPLE_REGISTERS:
         byte_count = pdu[1]
         body = pdu[2:]
         if len(body) != byte_count or byte_count % 2:
             raise ModbusError(ExceptionCode.SERVER_DEVICE_FAILURE, "字节数字段与实际长度不符")
-        if request.count and byte_count < request.count * 2:
+        # 同读寄存器：数量必须精确相等，多给少给都说明从站行为异常
+        if request.count and byte_count != request.count * 2:
             raise ModbusError(
                 ExceptionCode.SERVER_DEVICE_FAILURE,
-                f"FC23 应答只有 {byte_count // 2} 个寄存器，请求了 {request.count} 个")
+                f"FC23 应答 {byte_count // 2} 个寄存器，请求了 {request.count} 个")
         return Response(fc, _unpack_regs(body))
 
     raise ModbusError(ExceptionCode.ILLEGAL_FUNCTION, f"不支持功能码 0x{fc:02X}")
@@ -517,12 +561,21 @@ def build_device_id_request(code: int = 1, object_id: int = 0) -> bytes:
 
 def build_device_id_response(identity: dict[int, str], code: int = 1) -> bytes:
     wanted = _REGULAR_OBJECTS if code >= 2 else _BASIC_OBJECTS
+    # 整个 PDU 不能超过 253 字节（MBAP length 字段上限 254，减去 1 字节站地址）。
+    # 只截单对象 255 字节是不够的：7 个对象叠加起来照样超限，而超限帧装进
+    # MBAP 后任何标准主站（包括本工具自己的客户端）都会报「长度非法」拒收。
+    budget = 253 - 7          # 响应头固定 7 字节，剩下全给对象列表
     items = []
+    total = 0
     for object_id in wanted:
         if object_id not in identity:
             continue
-        value = str(identity[object_id]).encode("ascii", "replace")[:255]
+        room = budget - total - 2        # 每个对象还有 2 字节的 号+长度 头
+        if room <= 0:
+            break
+        value = str(identity[object_id]).encode("ascii", "replace")[:min(255, room)]
         items.append(bytes([object_id, len(value)]) + value)
+        total += 2 + len(value)
     conformity = 0x01 if code == 1 else (0x02 if code == 2 else 0x03)
     header = bytes([
         FC.READ_DEVICE_IDENTIFICATION, 0x0E, code & 0xFF,

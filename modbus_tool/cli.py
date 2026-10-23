@@ -19,22 +19,18 @@ from .codec import DataType, decode, encode, format_value, hex_of, span
 from .datastore import DataStore
 from .parsing import parse_write_values
 from .pdu import ModbusError, ParameterError, read_limit
-from .server import RtuServer, TcpServer
-from .transport import HAS_SERIAL, RtuTransport, TcpTransport, TransportError, list_serial_ports
-
-FC_NAMES = {
-    1: "读线圈",
-    2: "读离散输入",
-    3: "读保持寄存器",
-    4: "读输入寄存器",
-}
+from .server import RtuOverTcpServer, RtuServer, TcpServer
+from .transport import (HAS_SERIAL, RtuOverTcpTransport, RtuTransport, TcpTransport,
+                        TransportError, list_serial_ports)
 
 
 def _parse_endpoint(text: str, default_port: int) -> tuple[str, int]:
     if ":" in text:
         host, _, port = text.partition(":")
         try:
-            return host, int(port)
+            # `:5020` 这种写法 host 是空串：客户端连不上，从站则 bind("")
+            # 绑到全部网卡。统一回退 127.0.0.1，要全网段必须显式写 0.0.0.0。
+            return host or "127.0.0.1", int(port)
         except ValueError:
             raise SystemExit(f"端口必须是整数：「{port}」") from None
     return text, default_port
@@ -43,6 +39,8 @@ def _parse_endpoint(text: str, default_port: int) -> tuple[str, int]:
 def _add_link_args(parser: argparse.ArgumentParser) -> None:
     link = parser.add_mutually_exclusive_group(required=True)
     link.add_argument("--tcp", metavar="HOST[:PORT]", help="TCP 端点，端口默认 502")
+    link.add_argument("--rtutcp", metavar="HOST[:PORT]",
+                      help="RTU over TCP（串口服务器/DTU 透传），TCP 流里跑裸 RTU 帧")
     link.add_argument("--rtu", metavar="PORT", help="串口，例如 COM3 或 /dev/ttyUSB0")
     parser.add_argument("--baud", type=int, default=9600, help="波特率（RTU）")
     parser.add_argument("--parity", default="N", choices=list("NEOMS"), help="校验位（RTU）")
@@ -71,6 +69,9 @@ def _make_transport(args):
     if args.tcp:
         host, port = _parse_endpoint(args.tcp, 502)
         return TcpTransport(host, port, timeout=args.timeout)
+    if args.rtutcp:
+        host, port = _parse_endpoint(args.rtutcp, 502)
+        return RtuOverTcpTransport(host, port, timeout=args.timeout)
     if not HAS_SERIAL:
         raise SystemExit("RTU 模式需要 pyserial：pip install pyserial")
     return RtuTransport(
@@ -137,12 +138,12 @@ def _print_rows(values: list, address: int, fc: int, args) -> None:
 
 
 def cmd_read(args) -> int:
-    if args.fc not in FC_NAMES:
+    # 读类功能码的判定走 pdu.read_limit（单一来源），不再维护一份本地
+    # FC_NAMES —— 以前那份只含 1~4，和 frameparser 的全集是两套会漂移的表。
+    if read_limit(args.fc) is None:
         raise SystemExit("读操作的功能码只能是 1/2/3/4")
-    try:
-        address = _resolve_address(args.addr, args.fc, args.plc)
-    except AddressError as exc:
-        raise SystemExit(str(exc)) from None
+    # _resolve_address 内部已把 AddressError 转成 SystemExit，无需再捕获
+    address = _resolve_address(args.addr, args.fc, args.plc)
 
     limit = read_limit(args.fc)
     if limit is not None and not 1 <= args.count <= limit:
@@ -168,22 +169,27 @@ def cmd_read(args) -> int:
 
 
 def cmd_write(args) -> int:
-    try:
-        address = _resolve_address(args.addr, args.fc, args.plc)
-    except AddressError as exc:
-        raise SystemExit(str(exc)) from None
+    address = _resolve_address(args.addr, args.fc, args.plc)
 
-    values = _parse_values(args.value, args.fc, args.dtype)
-    if args.fc in (5, 15):
-        registers = values
+    if args.fc == 22:
+        # 掩码写的两个值是位掩码，不是物理量 —— 固定按 uint16/整数解析，
+        # 支持十进制、0x 十六进制、0b 二进制；用户选了 float32 也不该漂
+        values = _parse_values(args.value, 22, "uint16")
+        if len(values) != 2:
+            raise SystemExit("掩码写需要两个掩码：AND,OR（例如 0xFFF0,0x000F）")
+        registers = [v & 0xFFFF for v in values]
     else:
-        try:
-            registers = encode(values, args.dtype, args.byteorder, args.scale, args.bias)
-        except ValueError as exc:
-            raise SystemExit(str(exc)) from None
-        if args.fc == 6 and len(registers) != 1:
-            raise SystemExit(
-                f"{args.dtype} 占 {len(registers)} 个寄存器，单点写放不下，请改用 --fc 16")
+        values = _parse_values(args.value, args.fc, args.dtype)
+        if args.fc in (5, 15):
+            registers = values
+        else:
+            try:
+                registers = encode(values, args.dtype, args.byteorder, args.scale, args.bias)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from None
+            if args.fc == 6 and len(registers) != 1:
+                raise SystemExit(
+                    f"{args.dtype} 占 {len(registers)} 个寄存器，单点写放不下，请改用 --fc 16")
 
     client = ModbusClient(_make_transport(args), args.unit, args.retries)
     try:
@@ -204,10 +210,7 @@ def cmd_write(args) -> int:
 
 
 def cmd_poll(args) -> int:
-    try:
-        address = _resolve_address(args.addr, args.fc, args.plc)
-    except AddressError as exc:
-        raise SystemExit(str(exc)) from None
+    address = _resolve_address(args.addr, args.fc, args.plc)
 
     client = ModbusClient(_make_transport(args), args.unit, args.retries)
     print(f"开始轮询，间隔 {args.interval}s，Ctrl+C 结束")
@@ -243,12 +246,21 @@ def cmd_poll(args) -> int:
 
 def cmd_serve(args) -> int:
     store = DataStore(size=args.size)
-    for index, value in enumerate(_parse_values(args.init, 3, "uint16") if args.init else []):
+    init_values = _parse_values(args.init, 3, "uint16") if args.init else []
+    if len(init_values) > args.size:
+        # 以前这里靠 DataStore.set 抛 ModbusError，而 main() 只兜 ValueError，
+        # 用户看到的是裸 traceback。
+        raise SystemExit(
+            f"--init 提供了 {len(init_values)} 个初值，超出区间长度 --size {args.size}")
+    for index, value in enumerate(init_values):
         store.set("holding_registers", index, value)
 
     if args.tcp:
         host, port = _parse_endpoint(args.tcp, 502)
         server = TcpServer(host=host, port=port, store=store, unit=args.unit, on_log=print)
+    elif args.rtutcp:
+        host, port = _parse_endpoint(args.rtutcp, 502)
+        server = RtuOverTcpServer(host=host, port=port, store=store, unit=args.unit, on_log=print)
     else:
         if not HAS_SERIAL:
             raise SystemExit("RTU 模式需要 pyserial：pip install pyserial")
@@ -304,7 +316,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_write = sub.add_parser("write", help="写单个或多个值")
     _add_link_args(p_write)
     _add_view_args(p_write)
-    p_write.add_argument("--fc", type=int, default=6, choices=[5, 6, 15, 16], help="功能码")
+    p_write.add_argument("--fc", type=int, default=6, choices=[5, 6, 15, 16, 22],
+                         help="功能码（22 = 掩码写，值为 AND,OR 两个掩码）")
     p_write.add_argument("--addr", type=int, default=0, help="起始地址")
     p_write.add_argument("--value", required=True,
                          help="写入值，逗号分隔；按 --type 解释（float32 可直接写 220.5）")
@@ -323,6 +336,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve = sub.add_parser("serve", help="作为从站运行")
     link = p_serve.add_mutually_exclusive_group(required=True)
     link.add_argument("--tcp", metavar="HOST[:PORT]")
+    link.add_argument("--rtutcp", metavar="HOST[:PORT]",
+                      help="RTU over TCP：TCP 监听，流里跑裸 RTU 帧")
     link.add_argument("--rtu", metavar="PORT")
     p_serve.add_argument("--baud", type=int, default=9600)
     p_serve.add_argument("--parity", default="N", choices=list("NEOMS"))

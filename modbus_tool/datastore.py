@@ -191,6 +191,36 @@ class DataStore:
                     raise ModbusError(ExceptionCode.ILLEGAL_DATA_VALUE, f"值 {value} 超出 0~65535")
             self.holding_registers[address:address + len(values)] = [int(v) for v in values]
 
+    def rw_holding_registers(self, write_address: int, values: list[int],
+                             read_address: int, count: int) -> list[int]:
+        """FC23（读写复合）专用：先写后读必须在**同一个锁周期**内完成。
+
+        分成 write_holding_registers + read_holding_registers 两次拿锁的话，
+        两个主站并发连接时，写与读之间可能插入别人的写操作 —— 主站会读到
+        「不是自己刚写」的值，行为和真实设备对不上。锁是 RLock，内部的
+        单区操作可以安全重入。
+        """
+        with self._lock:
+            self.write_holding_registers(write_address, values)
+            self._check(read_address, count)
+            self._apply_signals("holding_registers", read_address, count)
+            return self.holding_registers[read_address:read_address + count]
+
+    def mask_write_holding(self, address: int, and_mask: int, or_mask: int) -> int:
+        """FC22（掩码写）：只改一个寄存器的某几位。
+
+        结果 = (当前值 AND and_mask) OR (or_mask AND NOT and_mask)。
+        and_mask 里为 1 的位保留原值，为 0 的位被 or_mask 对应位覆盖 ——
+        变频器的位域参数（运行命令字）就是这么改的，整字重写会误伤别的位。
+        读改写必须在同一个锁周期内完成，否则并发主站会插进自己的写操作。
+        """
+        with self._lock:
+            self._check(address, 1)
+            current = self.holding_registers[address]
+            updated = ((current & and_mask) | (or_mask & ~and_mask)) & 0xFFFF
+            self.holding_registers[address] = updated
+            return updated
+
     # -- 便于 GUI 直接操作的单元格接口 --------------------------------------
 
     def get(self, area: str, index: int) -> int | bool:

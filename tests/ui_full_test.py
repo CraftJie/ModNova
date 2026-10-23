@@ -228,6 +228,27 @@ class Runner:
 
         self.case("A 导航", "数据解释可反复打开", "关掉再点还能弹出", view_dialog_reopens)
 
+        def tabs_round_points():
+            """2026-10-24 M-1 回归：_round_points 曾漏 import math，矢量回退
+            路径一调用就 NameError（PNG 不可用的老 Tk 上整个切换条都建不出来）。"""
+            points = app.tabs._round_points(0, 0, 100, 30, 8)
+            return f"路径点数={len(points) // 2}", isinstance(points, list) and len(points) >= 16
+
+        self.case("A 导航", "切换条矢量路径", "圆角路径可计算（import math 在位）",
+                  tabs_round_points)
+
+        def cell_edit_without_server():
+            """2026-10-24 L-1 回归：从站已停时提交单元格编辑，应如实提示，
+            而不是解引用 None 抛 AttributeError 走崩溃钩子。"""
+            app.server = None
+            app._apply_cell_edit(0, "5", "dec")
+            self.pump(0.1)
+            hint = str(app.slave_edit_hint.cget("text"))
+            return hint, "从站已停止" in hint
+
+        self.case("A 导航", "无从站时提交编辑", "提示从站已停止，不崩溃",
+                  cell_edit_without_server)
+
         # ================= B 主站链路参数 =================
         self.case("B 链路", "默认 TCP 模式", "TCP 字段可见、RTU 不可见",
                   lambda: (f"TCP={bool(app.tcp_frame.winfo_ismapped())} "
@@ -241,13 +262,33 @@ class Runner:
             self.pump(0.2)
             rtu_shown = app.rtu_frame.winfo_ismapped()
             ports = app.rtu_port.get()
+            box_shows = app.link_box.get()          # 变量直接设键值后，下拉框显示要跟上
             app.link_mode.set("tcp")
             app._on_link_mode_change()
             self.pump(0.2)
-            return (f"RTU 显示={rtu_shown} 串口={ports or '(空)'} 已切回={bool(app.tcp_frame.winfo_ismapped())}",
-                    rtu_shown == 1 and app.tcp_frame.winfo_ismapped() == 1)
+            return (f"RTU 显示={rtu_shown} 串口={ports or '(空)'} 框显示={box_shows} "
+                    f"已切回={bool(app.tcp_frame.winfo_ismapped())}",
+                    rtu_shown == 1 and box_shows == "RTU"
+                    and app.tcp_frame.winfo_ismapped() == 1)
 
-        self.case("B 链路", "TCP/RTU 单选切换", "字段面板跟着换，切回正常", switch_rtu)
+        self.case("B 链路", "TCP/RTU 下拉切换", "字段面板跟着换，切回正常", switch_rtu)
+
+        def dropdown_select():
+            """模拟真实用户：在下拉框里选「RTU/TCP」，走 <<ComboboxSelected>> 路径。"""
+            app.link_box.set("RTU/TCP")
+            app._on_link_box_selected()
+            self.pump(0.2)
+            key = app.link_mode.get()
+            tcp_fields = bool(app.tcp_frame.winfo_ismapped())
+            shown = app.link_box.get()
+            app.link_box.set("TCP")
+            app._on_link_box_selected()
+            self.pump(0.2)
+            return (f"键={key} TCP字段={tcp_fields} 框显示={shown}",
+                    key == "rtutcp" and tcp_fields and shown == "RTU/TCP"
+                    and app.link_mode.get() == "tcp")
+
+        self.case("B 链路", "下拉框选 RTU/TCP", "内部键 rtutcp、复用 TCP 字段、可切回", dropdown_select)
 
         def bad_port():
             self.set_spin(app.tcp_port, "abc")
@@ -269,6 +310,46 @@ class Runner:
             return f"状态={text}", "超时" in text
 
         self.case("B 链路", "超时填非数字", "提示超时必须为数字", bad_timeout)
+
+        def unit_input_guard():
+            """站地址敲入 9999：整串插入被拒；逐位敲最多停在 247。"""
+            self.set_spin(app.unit_var, "9999")
+            whole = app.unit_var.get()
+            app.unit_var.delete(0, "end")
+            for ch in "2479":
+                app.unit_var.insert("end", ch)
+            typed = app.unit_var.get()
+            self.set_spin(app.unit_var, "1")      # 恢复，别影响后面的自环连接
+            return (f"整串插入后={whole!r} 逐位敲后={typed!r}",
+                    whole == "" and typed == "247")
+
+        self.case("B 链路", "站地址敲入越界", "键入 9999 被拒，逐位敲最多到 247",
+                  unit_input_guard)
+
+        def numeric_guards():
+            """其余数值参数同样带按键护栏：越界整串被拒、合法小数照常。"""
+            def try_set(widget, text):
+                self.set_spin(widget, text)
+                return widget.get()
+
+            port = try_set(app.tcp_port, "99999")
+            count = try_set(app.count_var, "3000")
+            interval = try_set(app.interval_var, "99999")
+            timeout_bad = try_set(app.timeout_var, "99")
+            timeout_ok = try_set(app.timeout_var, "2.5")
+            drop = try_set(app.fault_drop, "150")
+            self.set_spin(app.tcp_port, "502")
+            self.set_spin(app.count_var, "10")
+            self.set_spin(app.interval_var, "500")
+            self.set_spin(app.timeout_var, "2")
+            self.set_spin(app.fault_drop, "0")
+            return (f"端口={port!r} 数量={count!r} 间隔={interval!r} "
+                    f"超时99={timeout_bad!r} 超时2.5={timeout_ok!r} 丢包150={drop!r}",
+                    port == "" and count == "" and interval == ""
+                    and timeout_bad == "" and timeout_ok == "2.5" and drop == "")
+
+        self.case("B 链路", "数值参数键入护栏", "端口/数量/间隔/超时/故障率越界被拒，小数放行",
+                  numeric_guards)
 
         self.case("B 链路", "未连接点「读取」", "提示尚未连接",
                   lambda: (app._do_read_async() or self.pump(0.2) or
@@ -331,7 +412,7 @@ class Runner:
             return (f"RTU 显示={shown} 波特率={baud} 已切回={bool(app.slave_tcp_frame.winfo_ismapped())}",
                     shown == 1 and app.slave_tcp_frame.winfo_ismapped() == 1)
 
-        self.case("C 从站", "TCP/RTU 单选切换", "串口字段出现，切回正常", slave_rtu_switch)
+        self.case("C 从站", "TCP/RTU 下拉切换", "串口字段出现，切回正常", slave_rtu_switch)
 
         app.demo_var.set(False)          # 先关掉演示数据，保证后面的值可控
         self.set_entry(app.slave_host, "127.0.0.1")
@@ -807,6 +888,103 @@ class Runner:
 
         self.case("F 写", "FC06 填多个值", "提示单点写入只能一个值", write_single_many)
 
+        def write_fc22():
+            """掩码写：AND 为 0 的位被 OR 覆盖，其余位保持原值。"""
+            app.server.store.set("holding_registers", 30, 0xAB12)
+            self.pick_fc(22)
+            self.set_spin(app.addr_var, "30")
+            self.set_entry(app.write_var, "0xFFF0,0x000F")
+            app._do_write_async()
+            self.wait(lambda: self.slave_values("holding_registers", 30, 1)[0] == 0xAB1F,
+                      timeout=4)
+            self.pump(0.25)
+            value = self.slave_values("holding_registers", 30, 1)[0]
+            shown = self.status()
+            return (f"从站[30]=0x{value:04X} 状态={shown}",
+                    value == 0xAB1F and "已写入" in shown and "1 个寄存器" in shown)
+
+        self.case("F 写", "FC22 掩码写", "只改低 4 位：0xAB12 → 0xAB1F，状态报 1 个寄存器", write_fc22)
+
+        def write_fc22_bad():
+            self.set_entry(app.write_var, "0xFFF0")
+            app._do_write_async()
+            self.pump(0.25)
+            return self.status(), "两个掩码" in self.status()
+
+        self.case("F 写", "FC22 缺掩码", "提示需要 AND/OR 两个掩码", write_fc22_bad)
+
+        # ================= M 新能力（识别 / CSV / 故障注入）=================
+        def identify_device():
+            app._identify_device_async()
+            ok = self.wait(lambda: "设备标识：" in self.status(), timeout=4)
+            self.pump(0.2)
+            text = self.status()
+            return f"状态={text}", ok and "ModNova" in text
+
+        self.case("M 新能力", "FC2B 设备识别", "状态栏与日志出现厂商 ModNova", identify_device)
+
+        def csv_record():
+            self.set_spin(app.addr_var, "0")
+            self.pick_fc(3)
+            app.csv_var.set(True)
+            app._toggle_csv()
+            self.pump(0.2)
+            app._do_read_async()
+            self.wait(lambda: len(self.rows(app.result_tree)) == 10, timeout=4)
+            self.pump(0.2)
+            path = app._csv.path if app._csv else ""
+            app.csv_var.set(False)
+            app._toggle_csv()
+            self.pump(0.2)
+            if not path or not os.path.exists(path):
+                return f"文件不存在：{path}", False
+            with open(path, encoding="utf-8-sig") as handle:
+                content = handle.read()
+            os.remove(path)
+            return (f"文件含 FC03 行={('FC03' in content)}",
+                    "FC03" in content and ",0" in content)
+
+        self.case("M 新能力", "CSV 记录", "勾选后读一次，文件里出现 FC03 数据行", csv_record)
+
+        def trend_track():
+            """模拟「点选格子」：跟踪 1 号寄存器，两次读数后趋势条应画出折线。"""
+            self.pick_fc(3)
+            self.set_spin(app.addr_var, "0")
+            self.set_spin(app.count_var, "4")
+            app._set_trend_key(1)
+            app._do_read_async()
+            self.wait(lambda: len(self.rows(app.result_tree)) == 4, timeout=4)
+            self.pump(0.2)
+            app.server.store.set("holding_registers", 1, 4321)
+            app._do_read_async()
+            self.wait(lambda: len(app._trend) >= 2, timeout=4)
+            self.pump(0.3)
+            items = len(app.trend_canvas.find_all())
+            return (f"趋势点数={len(app._trend)} 画布元素={items}",
+                    len(app._trend) >= 2 and items >= 2)
+
+        self.case("M 新能力", "迷你趋势条", "跟踪寄存器 1，两次读数后画出折线（占位文字消失）",
+                  trend_track)
+
+        def fault_exception():
+            app.fault_exc.set("100")
+            app.fault_exc_code.set("2")
+            app._apply_faults()
+            self.pump(0.2)
+            app._do_read_async()
+            ok = self.wait(lambda: "读取失败" in self.status(), timeout=4)
+            text = self.status()
+            injected = "注入中" in str(app.fault_stat.cget("text"))
+            app._clear_faults()
+            self.pump(0.2)
+            app._do_read_async()
+            self.wait(lambda: "共" in self.status() and "失败" not in self.status(), timeout=4)
+            return (f"状态={text} 面板={injected}",
+                    ok and "超出从站范围" in text and injected)
+
+        self.case("M 新能力", "故障注入：100% 异常码 2", "读取失败且报「超出从站范围」，清零后恢复",
+                  fault_exception)
+
         # ================= G 类型 / 字节序 / 缩放 / PLC =================
         def dtype_default():
             self.pick_dtype("uint16")
@@ -1062,6 +1240,23 @@ class Runner:
 
         self.case("H 轮询", "「停止轮询」", "按钮复位并记日志", poll_stop)
 
+        def poll_fc_switch_stops():
+            """轮询进行中把功能码切到写码 → 轮询立即停，不等失败计数。"""
+            app._toggle_poll()
+            self.pump(0.5)
+            running = app._polling
+            self.pick_fc(6)
+            self.pump(0.3)
+            stopped = not app._polling
+            btn = str(app.poll_btn.cget("text"))
+            self.pick_fc(3)
+            self.pump(0.2)
+            return (f"切码前轮询={running} 切到FC06后={stopped} 按钮={btn}",
+                    running and stopped and btn == "开始轮询")
+
+        self.case("H 轮询", "切到写码自动停轮询", "轮询中把功能码切到 FC06，轮询立即停止",
+                  poll_fc_switch_stops)
+
         def poll_disconnect_stops():
             app._toggle_poll()
             self.pump(0.5)
@@ -1073,6 +1268,12 @@ class Runner:
         self.case("H 轮询", "轮询中断开连接", "轮询自动停止", poll_disconnect_stops)
 
         # ================= I 日志 =================
+        def log_default_off():
+            """运行日志默认零落盘：界面照常显示，留档走「导出…」。"""
+            return f"logger={app.logger}", app.logger is None
+
+        self.case("I 日志", "默认不落盘", "启动后不写任何日志文件", log_default_off)
+
         def log_frames():
             app._toggle_connection()          # 重新连上
             self.wait(lambda: app.client is not None, timeout=4)

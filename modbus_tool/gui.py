@@ -15,18 +15,24 @@ from __future__ import annotations
 
 import base64
 import collections
+import csv
 import math
+import os
 import queue
+import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 from .addressing import AddressError, area_of_fc, display_address, resolve_address
+from .applog import install_excepthook
 from .client import ModbusClient
 from .codec import (
+    DTYPE_LABEL,
     NONPRINT,
     as_signed16,
     bin_of,
+    DataType,
     decode,
     encode,
     format_value,
@@ -35,13 +41,14 @@ from .codec import (
     patch_ascii,
     span,
 )
-from .datastore import DataStore
+from .datastore import BIT_AREAS, DataStore
+from .frameparser import parse_frame
 from .parsing import normalize_number as _normalize_number
 from .parsing import parse_int as _parse_int
-from .parsing import parse_write_values
-from .pdu import describe_error, describe_write_frame, read_limit, write_limit
-from .server import RtuServer, TcpServer
-from .transport import HAS_SERIAL, RtuTransport, TcpTransport, TransportError, list_serial_ports
+from .parsing import parse_write_values, split_values as _split_values
+from .pdu import DEVICE_ID_OBJECTS, describe_error, describe_write_frame, read_limit, write_limit
+from .server import FaultConfig, RtuOverTcpServer, RtuServer, TcpServer
+from .transport import HAS_SERIAL, RtuOverTcpTransport, RtuTransport, TcpTransport, TransportError, list_serial_ports
 from .ui_render import icon_png, photo, png_rgba, render_rounded
 from .ui_tabs import SegmentedTabs
 from .ui_theme import (
@@ -79,7 +86,16 @@ FC_OPTIONS = [
     ("06  写单寄存器", 6),
     ("15  写多线圈", 15),
     ("16  写多寄存器", 16),
+    ("22  掩码写寄存器", 22),
 ]
+
+# 链路模式的显示标签 ↔ 内部键。link_mode / slave_mode 里始终存内部键
+# （tcp / rtutcp / rtu），下拉框只负责显示 —— _build_transport、_toggle_server
+# 和测试都只认键，标签以后想改文案不影响逻辑。
+LINK_LABELS = {"tcp": "TCP", "rtutcp": "RTU/TCP", "rtu": "RTU"}
+LINK_KEYS = {label: key for key, label in LINK_LABELS.items()}
+SLAVE_MODE_LABELS = {"tcp": "TCP 监听", "rtutcp": "RTU/TCP 透传", "rtu": "RTU 串口"}
+SLAVE_MODE_KEYS = {label: key for key, label in SLAVE_MODE_LABELS.items()}
 
 AREA_OPTIONS = [
     ("线圈 (可读写·位)", "coils"),
@@ -89,7 +105,46 @@ AREA_OPTIONS = [
 ]
 
 # 写功能码 → 对应的读功能码，用于写完之后回读校验
-READBACK_FC = {5: 1, 6: 3, 15: 1, 16: 3}
+READBACK_FC = {5: 1, 6: 3, 15: 1, 16: 3, 22: 3}
+
+# 明细视图最多渲染的行数。Tk Treeview 是整表重建模型，2000 行线圈
+# 每 500ms 轮询重画一次会把界面拖垮；超出部分截断并提示（网格视图
+# 每 10 格才一行，不在其列）。读寄存器上限 125，天然够不到这个数。
+MAX_DETAIL_ROWS = 1000
+
+
+class _CsvSession:
+    """界面侧的 CSV 记录会话。
+
+    core.py 的记录器挂在 ModbusCore.read 流程上，而界面直接持有
+    ModbusClient —— 所以这里做一个薄会话，只在读完成时补一行，
+    格式与 core 侧一致（utf-8-sig，Excel 打开中文不乱码）。
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.rows = 0
+        self._file = open(path, "w", newline="", encoding="utf-8-sig")
+        self._writer = csv.writer(self._file)
+
+    def write(self, cells: list) -> None:
+        self._writer.writerow(cells)
+        self.rows += 1
+        if self.rows % 10 == 0:
+            self._file.flush()
+
+    def close(self) -> None:
+        try:
+            self._file.flush()
+            self._file.close()
+        except OSError:
+            pass
+
+
+def _default_csv_path() -> str:
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    name = f"modnova-csv-{time.strftime('%Y%m%d-%H%M%S')}.csv"
+    return os.path.join(base, "ModNova", "logs", name)
 
 DTYPE_SHORT = {
     "uint16": "u16", "int16": "i16", "uint32": "u32", "int32": "i32",
@@ -97,18 +152,9 @@ DTYPE_SHORT = {
     "ascii": "ASCII",
 }
 
-DTYPE_OPTIONS = [
-    ("无符号 16 位", "uint16"),
-    ("有符号 16 位", "int16"),
-    ("无符号 32 位", "uint32"),
-    ("有符号 32 位", "int32"),
-    ("单精度浮点", "float32"),
-    ("无符号 64 位", "uint64"),
-    ("有符号 64 位", "int64"),
-    ("双精度浮点", "float64"),
-    # 放在最后：前 8 项的索引不要动，测试和工作流里都有按下标取值的地方
-    ("ASCII 字符", "ascii"),
-]
+# 由 codec.DTYPE_LABEL 派生（ vocabulary 单一来源 ），顺序即 DataType 枚举序：
+# ASCII 殿后 —— 前 8 项的下标不要动，测试和工作流里都有按下标取值的地方。
+DTYPE_OPTIONS = [(DTYPE_LABEL[t], t.value) for t in DataType]
 
 class ModbusApp:
     def __init__(self, root: tk.Tk) -> None:
@@ -123,6 +169,12 @@ class ModbusApp:
         # 但数据区仍然保证 20 行以上。
         self.root.minsize(1040, 680)
         self.root.configure(bg=BG)
+
+        # 运行日志尽早就位：之后的每一条 _log（含报文）都会镜像进滚动文件，
+        # 界面被关掉/崩掉之后，事后追查靠的就是它
+        # 运行日志默认不落盘：界面看完就完，要留证据时用日志面板的「导出…」。
+        # self.logger 为 None 时 _log 只进界面，一行文件都不写。
+        self.logger = None
 
         self.client: ModbusClient | None = None
         self.server = None
@@ -145,6 +197,7 @@ class ModbusApp:
         self._log_lines = 0
         self._log_paused = False
         self._log_skipped = 0
+        self._csv = None                  # CSV 记录会话（勾选「记录 CSV」时存在）
         self._slave_sig = None          # 上一次从站表格的内容指纹，用来跳过无变化的刷新
         # -- 链路健康：站号、连续失败次数、状态（on / warn / down）--
         self._link_text = ""            # 例如 "TCP 127.0.0.1:15040"
@@ -157,7 +210,7 @@ class ModbusApp:
         self._fade_job = None
         # -- 迷你趋势条：选中单元格的历史值 --
         self._trend: collections.deque = collections.deque(maxlen=120)
-        self._trend_key: tuple | None = None
+        self._trend_key: int | None = None
         self._grid_per = 10             # 网格当前每行格数（点击定位要用）
         self._grid_pad = 0              # 首行左侧留空几格（十六进制对齐用）
         self._view_state: dict = {}     # 数据解释的当前值（弹层重建时恢复）
@@ -169,6 +222,7 @@ class ModbusApp:
         self._build_ui()
         self._on_link_mode_change()
         self._on_fc_change()
+        self._log("运行日志仅在界面显示；需要留档时用「导出…」手动保存")
         self._drain_events()
         self._tick_slave_refresh()
         self._tick_demo()
@@ -405,6 +459,32 @@ class ModbusApp:
         ttk.Label(parent, text=label, style="Sub.TLabel").pack(side="left", padx=(0, 4))
         widget.pack(side="left", padx=(0, 10))
 
+    def _install_input_guard(self, widget, maximum: int | float,
+                             decimal: bool = False) -> None:
+        """让 Spinbox 的手敲输入和方向键一样守规矩。
+
+        from_/to 只约束点击箭头，键盘敲进去的它不管 —— 站地址能敲出 9999
+        就是这么来的。挂按键级校验：非数字拒、超上限拒；清空允许（中间态），
+        下限留给连接/启动时的 _int_field 报人话。粘贴也走同一道闸。
+        decimal=True 的小数字段（超时）额外放行一个小数点，"2." 这类中间态合法。
+        """
+        def check(proposed: str) -> bool:
+            if proposed == "":
+                return True
+            if decimal:
+                if proposed.count(".") > 1:
+                    return False
+                if not proposed.replace(".", "").isdigit():
+                    return False
+                try:
+                    return float(proposed) <= maximum
+                except ValueError:
+                    return False
+            return proposed.isdigit() and int(proposed) <= maximum
+
+        widget.configure(validate="key",
+                         validatecommand=(self.root.register(check), "%P"))
+
     def _build_connect_bar(self) -> None:
         """连接参数只在「没连上」的时候占位置。
 
@@ -416,10 +496,12 @@ class ModbusApp:
         self.connect_bar = bar
 
         self.link_mode = tk.StringVar(value="tcp")
-        ttk.Radiobutton(bar, text="TCP", value="tcp", variable=self.link_mode,
-                        command=self._on_link_mode_change).pack(side="left")
-        ttk.Radiobutton(bar, text="RTU", value="rtu", variable=self.link_mode,
-                        command=self._on_link_mode_change).pack(side="left", padx=(6, 12))
+        ttk.Label(bar, text="链路", style="Sub.TLabel").pack(side="left", padx=(0, 4))
+        self.link_box = ttk.Combobox(bar, values=list(LINK_LABELS.values()),
+                                     state="readonly", width=9)
+        self.link_box.set(LINK_LABELS["tcp"])
+        self.link_box.bind("<<ComboboxSelected>>", self._on_link_box_selected)
+        self.link_box.pack(side="left", padx=(0, 12))
 
         self.link_holder = ttk.Frame(bar)
         self.link_holder.pack(side="left")
@@ -431,12 +513,13 @@ class ModbusApp:
         self._bar_field(self.tcp_frame, "主机", self.tcp_host)
         self.tcp_port = ttk.Spinbox(self.tcp_frame, from_=1, to=65535, width=6)
         self.tcp_port.set("502")
+        self._install_input_guard(self.tcp_port, 65535)
         self._bar_field(self.tcp_frame, "端口", self.tcp_port)
 
         self.rtu_frame = ttk.Frame(self.link_holder)
         ports = list_serial_ports()
         self.rtu_port = ttk.Combobox(self.rtu_frame, values=ports, width=9)
-        self.rtu_port.set(ports[0] if ports else ("COM3" if ports == [] else ""))
+        self.rtu_port.set(ports[0] if ports else "")
         self._bar_field(self.rtu_frame, "串口", self.rtu_port)
         self.baud = ttk.Combobox(self.rtu_frame, values=["4800", "9600", "19200", "38400", "57600", "115200"],
                                  width=7, state="readonly")
@@ -460,12 +543,16 @@ class ModbusApp:
         common.pack(side="left", padx=(8, 0))
         self.unit_var = ttk.Spinbox(common, from_=1, to=247, width=4)
         self.unit_var.set("1")
+        # Modbus 单元号合法域 1~247（0 广播、248+ 保留）：手敲也不许越过 247
+        self._install_input_guard(self.unit_var, 247)
         self._bar_field(common, "站地址", self.unit_var)
         self.timeout_var = ttk.Spinbox(common, from_=0.1, to=30, increment=0.5, width=4)
         self.timeout_var.set("2")
+        self._install_input_guard(self.timeout_var, 30, decimal=True)
         self._bar_field(common, "超时", self.timeout_var)
         self.retry_var = ttk.Spinbox(common, from_=0, to=5, width=3)
         self.retry_var.set("1")
+        self._install_input_guard(self.retry_var, 5)
         self._bar_field(common, "重试", self.retry_var)
 
         ttk.Button(bar, text="连接", style="Accent.TButton", width=6,
@@ -616,11 +703,13 @@ class ModbusApp:
         label("地址")
         self.addr_var = ttk.Spinbox(bar, from_=0, to=65535, width=6)
         self.addr_var.set("0")
+        self._install_input_guard(self.addr_var, 65535)
         self.addr_var.pack(side="left", padx=(0, 10))
 
         label("数量")
         self.count_var = ttk.Spinbox(bar, from_=1, to=2000, width=5)
         self.count_var.set("10")
+        self._install_input_guard(self.count_var, 2000)
         self.count_var.pack(side="left", padx=(0, 10))
 
         self.write_label = ttk.Label(bar, text="值", style="Sub.TLabel")
@@ -638,12 +727,17 @@ class ModbusApp:
         self.read_btn.pack(side="left")
         self.write_btn = ttk.Button(bar, text="写入", width=5, command=self._do_write_async)
         self.write_btn.pack(side="left", padx=(6, 0))
+        # FC2B 读设备识别：联调第一步「对面到底是谁」——厂商/型号/版本一次看全
+        self.identify_btn = ttk.Button(bar, text="识别", width=5,
+                                       command=self._identify_device_async)
+        self.identify_btn.pack(side="left", padx=(6, 0))
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=12)
 
         label("轮询")
         self.interval_var = ttk.Spinbox(bar, from_=50, to=60000, increment=50, width=5)
         self.interval_var.set("500")
+        self._install_input_guard(self.interval_var, 60000)
         self.interval_var.pack(side="left")
         ttk.Label(bar, text="ms", style="Sub.TLabel").pack(side="left", padx=(3, 8))
         self.poll_btn = ttk.Button(bar, text="开始轮询", width=8, command=self._toggle_poll)
@@ -683,10 +777,18 @@ class ModbusApp:
 
         self.log_toggle_btn = ttk.Button(row, text="▴ 日志 0", command=self._toggle_log_panel)
         self.log_toggle_btn.pack(side="right")
-        self.trend_canvas = tk.Canvas(row, width=110, height=18, bg=CARD, highlightthickness=0)
-        self.trend_canvas.pack(side="right", padx=(10, 12))
+        self.trend_canvas = tk.Canvas(row, width=150, height=20, bg=CARD, highlightthickness=0)
+        # -- 迷你趋势条暂时从状态栏下架（2026-10-24）：绘制与点选逻辑全部保留
+        #    （_draw_trend / _push_trend / _set_trend_key / _on_table_click 照常运行，
+        #    只是画在一张不显示的画布上），恢复显示 = 取消下面这行的注释。
+        # self.trend_canvas.pack(side="right", padx=(10, 12))
         self.stats_label = ttk.Label(row, text="", style="Muted.TLabel")
         self.stats_label.pack(side="right")
+        # 轮询/读取的结果落 CSV：挂状态栏比藏菜单里更容易被想起来用
+        self.csv_var = tk.BooleanVar(value=False)
+        self.csv_check = ttk.Checkbutton(row, text="记录 CSV",
+                                         variable=self.csv_var, command=self._toggle_csv)
+        self.csv_check.pack(side="right", padx=(0, 12))
 
     # -- 数据解释弹层（类型/字节序/系数/单位/地址记法）---------------------
 
@@ -722,15 +824,21 @@ class ModbusApp:
         self.scale_var.insert(0, "1")
         self._dialog_row(body, 3, "× 系数", self.scale_var)
 
+        # core.read/write 一直支持 bias，但弹层以前只有系数没有偏移，
+        # 显示值 = 原始值 × scale + bias 的公式在界面上缺了一半
+        self.bias_var = ttk.Entry(body, width=10)
+        self.bias_var.insert(0, "0")
+        self._dialog_row(body, 4, "+ 偏移", self.bias_var)
+
         self.unit_text_var = ttk.Entry(body, width=10)
-        self._dialog_row(body, 4, "单位", self.unit_text_var)
+        self._dialog_row(body, 5, "单位", self.unit_text_var)
 
         # 地址记法和「值怎么解释」是两件事，用一条分隔线分开，
         # 否则混在类型/字节序下面，会以为地址也是数据类型的一部分
-        ttk.Separator(body).grid(row=5, column=0, columnspan=2,
+        ttk.Separator(body).grid(row=6, column=0, columnspan=2,
                                  sticky="ew", pady=(12, 6))
         ttk.Label(body, text="地址怎么记", style="Muted.TLabel").grid(
-            row=6, column=0, columnspan=2, sticky="w", pady=(0, 2))
+            row=7, column=0, columnspan=2, sticky="w", pady=(0, 2))
 
         # 三种记法互斥，所以是单选（Modbus Poll 也是 Base 1 / Base 0 二选一）。
         # 以前这里是两个复选框，而渲染时 PLC 优先（_addr_hex and not plc_var），
@@ -744,10 +852,10 @@ class ModbusApp:
                 ("PLC 记法（40001 起）", "plc"))):
             ttk.Radiobutton(body, text=text, value=value, variable=self._addr_mode,
                             command=self._addr_mode_changed).grid(
-                row=7 + offset, column=0, columnspan=2, sticky="w", pady=(2, 0))
+                row=8 + offset, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         ttk.Button(body, text="关闭", command=self._close_view_dialog).grid(
-            row=10, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+            row=11, column=0, columnspan=2, sticky="ew", pady=(14, 0))
 
         # 重建时把上次的设置放回去，别把用户选的 float32 悄悄变回 u16
         state = self._view_state
@@ -756,6 +864,8 @@ class ModbusApp:
             self.byteorder_box.set(state.get("byteorder", "ABCD"))
             self.scale_var.delete(0, "end")
             self.scale_var.insert(0, state.get("scale", "1"))
+            self.bias_var.delete(0, "end")
+            self.bias_var.insert(0, state.get("bias", "0"))
             self.unit_text_var.delete(0, "end")
             self.unit_text_var.insert(0, state.get("unit", ""))
             self.plc_var.set(bool(state.get("plc", False)))
@@ -767,6 +877,112 @@ class ModbusApp:
             row=row, column=0, sticky="w", pady=4)
         widget.grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=4)
         parent.columnconfigure(1, weight=1)
+
+    # -- 报文解析弹层（粘贴一帧 hex，逐字段拆给人看）-----------------------
+
+    def _build_parser_dialog(self) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("报文解析")
+        win.configure(bg=CARD)
+        win.withdraw()
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self._close_parser_dialog)
+        win.bind("<Escape>", lambda e: self._close_parser_dialog())
+
+        body = ttk.Frame(win, style="Inner.TFrame", padding=(18, 16, 18, 14))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
+        ttk.Label(body, text="粘贴一帧十六进制报文（自动识别 TCP / RTU 外壳）",
+                  style="CardTitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        input_row = ttk.Frame(body, style="Inner.TFrame")
+        input_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.parser_mode = ttk.Combobox(
+            input_row, values=("自动", "Modbus TCP", "Modbus RTU", "裸 PDU"),
+            state="readonly", width=11)
+        self.parser_mode.current(0)
+        self.parser_mode.pack(side="left")
+        ttk.Button(input_row, text="解析", style="Accent.TButton",
+                   command=self._run_parser).pack(side="left", padx=(8, 0))
+        ttk.Button(input_row, text="填入选中日志行",
+                   command=self._parser_fill_from_log).pack(side="left", padx=(8, 0))
+
+        self.parser_input = tk.Text(body, height=3, bg="#f9fafb", fg=TEXT,
+                                    font=LOG_FONT, relief="flat", padx=8, pady=6,
+                                    insertbackground=TEXT, wrap="char")
+        self.parser_input.grid(row=2, column=0, sticky="ew")
+        ttk.Label(body, text="解析结果", style="Muted.TLabel").grid(
+            row=3, column=0, sticky="w", pady=(8, 2))
+        self.parser_output = tk.Text(body, height=12, bg="#f9fafb", fg=TEXT,
+                                     font=LOG_FONT, relief="flat", padx=8, pady=6,
+                                     state="disabled", wrap="word")
+        self.parser_output.grid(row=4, column=0, sticky="nsew")
+        ttk.Button(body, text="关闭", command=self._close_parser_dialog).grid(
+            row=5, column=0, sticky="ew", pady=(10, 0))
+        self._parser_dialog = win
+
+    _PARSER_MODES = {"自动": "auto", "Modbus TCP": "tcp",
+                     "Modbus RTU": "rtu", "裸 PDU": "pdu"}
+
+    def _parser_fill_from_log(self) -> None:
+        """把日志里最后一条 TX/RX 帧的 hex 填进输入框，省一次复制粘贴。"""
+        content = self.log_text.get("1.0", "end")
+        for line in reversed(content.splitlines()):
+            s = line.strip()
+            for tag in ("TX ", "RX "):
+                pos = s.find(tag)
+                if pos != -1 and pos <= 14:
+                    hex_text = s[pos + len(tag):].strip()
+                    if hex_text:
+                        self.parser_input.delete("1.0", "end")
+                        self.parser_input.insert("1.0", hex_text)
+                        return
+        self._log("日志里没有找到报文帧（TX/RX 行）")
+
+    def _run_parser(self) -> None:
+        mode = self._PARSER_MODES.get(self.parser_mode.get(), "auto")
+        raw = self.parser_input.get("1.0", "end").strip()
+        self.parser_output.configure(state="normal")
+        self.parser_output.delete("1.0", "end")
+        try:
+            lines = parse_frame(raw, mode)
+        except ValueError as exc:
+            self.parser_output.insert("end", f"✕ {exc}\n", "err")
+        except Exception as exc:               # 解析器自身的缺陷也不该无声无息
+            self.parser_output.insert("end", f"✕ 内部错误：{exc}\n", "err")
+        else:
+            for line in lines:
+                tag = "err" if "⚠" in line or "✕" in line else ""
+                self.parser_output.insert("end", line + "\n", tag)
+        self.parser_output.tag_configure("err", foreground=ERR)
+        self.parser_output.configure(state="disabled")
+
+    def _open_parser_dialog(self) -> None:
+        if not getattr(self, "_parser_dialog", None) or not self._parser_dialog.winfo_exists():
+            self._build_parser_dialog()
+        self._toggle_log_panel(True)
+        win = self._parser_dialog
+        win.deiconify()
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_reqwidth()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_reqheight()) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.lift()
+        win.focus_force()
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+    def _close_parser_dialog(self) -> None:
+        dialog = getattr(self, "_parser_dialog", None)
+        if dialog is not None and dialog.winfo_exists():
+            dialog.withdraw()
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
 
     def _open_view_dialog(self) -> None:
         if not self._view_dialog.winfo_exists():
@@ -829,12 +1045,12 @@ class ModbusApp:
         mode_row = ttk.Frame(cfg_body, style="Inner.TFrame")
         mode_row.pack(fill="x", pady=(0, 6))
         self.slave_mode = tk.StringVar(value="tcp")
-        ttk.Radiobutton(mode_row, text="TCP 监听", value="tcp",
-                        variable=self.slave_mode,
-                        command=self._on_slave_mode_change).pack(side="left")
-        ttk.Radiobutton(mode_row, text="RTU 串口", value="rtu",
-                        variable=self.slave_mode,
-                        command=self._on_slave_mode_change).pack(side="left", padx=(14, 0))
+        ttk.Label(mode_row, text="模式", style="Sub.TLabel").pack(side="left", padx=(0, 4))
+        self.slave_mode_box = ttk.Combobox(mode_row, values=list(SLAVE_MODE_LABELS.values()),
+                                           state="readonly", width=12)
+        self.slave_mode_box.set(SLAVE_MODE_LABELS["tcp"])
+        self.slave_mode_box.bind("<<ComboboxSelected>>", self._on_slave_box_selected)
+        self.slave_mode_box.pack(side="left")
 
         self.slave_link_holder = ttk.Frame(cfg_body, style="Inner.TFrame")
         self.slave_link_holder.pack(fill="x")
@@ -847,6 +1063,7 @@ class ModbusApp:
         self._form_row(self.slave_tcp_frame, 0, "监听地址", self.slave_host)
         self.slave_port = ttk.Spinbox(self.slave_tcp_frame, from_=1, to=65535, width=8)
         self.slave_port.set("502")
+        self._install_input_guard(self.slave_port, 65535)
         self._form_row(self.slave_tcp_frame, 1, "端口", self.slave_port)
         ttk.Label(self.slave_tcp_frame, text="局域网访问请改成 0.0.0.0",
                   style="Muted.TLabel").grid(row=2, column=0, columnspan=2,
@@ -884,9 +1101,11 @@ class ModbusApp:
         common.pack(fill="x")
         self.slave_unit = ttk.Spinbox(common, from_=0, to=247, width=8)
         self.slave_unit.set("1")
+        self._install_input_guard(self.slave_unit, 247)
         self._form_row(common, 0, "站地址", self.slave_unit)
         self.slave_size = ttk.Spinbox(common, from_=1, to=65536, width=8)
         self.slave_size.set("10000")
+        self._install_input_guard(self.slave_size, 65536)
         self._form_row(common, 1, "区间长度", self.slave_size)
 
         self.slave_btn = ttk.Button(cfg_body, text="启动从站", style="Accent.TButton",
@@ -900,6 +1119,45 @@ class ModbusApp:
         self.slave_stat = ttk.Label(cfg_body, text="未启动", style="Muted.TLabel",
                                     justify="left", wraplength=250)
         self.slave_stat.pack(anchor="w", pady=(10, 0))
+
+        # -- 故障注入：把「从站突然不回/回了半帧/CRC 坏了」按需造出来，
+        #    验证自己写的上位机会不会崩、会不会把异常当 0。真实设备出问题
+        #    时往往不给你复现机会，这里是唯一能"造故障"的地方。
+        ttk.Separator(cfg_body).pack(fill="x", pady=(12, 8))
+        ttk.Label(cfg_body, text="故障注入（验证上位机容错）",
+                  style="CardTitle.TLabel").pack(anchor="w", pady=(0, 6))
+        fault = ttk.Frame(cfg_body, style="Inner.TFrame")
+        fault.pack(fill="x")
+        fault.columnconfigure(1, weight=1)
+        fault.columnconfigure(3, weight=1)
+
+        def fault_field(row: int, col: int, label: str, initial: str,
+                        maximum: int, width: int = 6):
+            ttk.Label(fault, text=label, style="Card.TLabel").grid(
+                row=row, column=col, sticky="w", pady=2)
+            box = ttk.Spinbox(fault, from_=0, to=maximum, width=width)
+            box.set(initial)
+            self._install_input_guard(box, maximum)
+            box.grid(row=row, column=col + 1, sticky="w", padx=(4, 10), pady=2)
+            return box
+
+        self.fault_drop = fault_field(0, 0, "丢包 %", "0", 100)
+        self.fault_delay = fault_field(0, 2, "延迟 ms", "0", 60000)
+        self.fault_exc = fault_field(1, 0, "异常 %", "0", 100)
+        self.fault_exc_code = fault_field(1, 2, "异常码", "4", 255)
+        self.fault_trunc = fault_field(2, 0, "截断 %", "0", 100)
+        self.fault_crc = fault_field(2, 2, "坏CRC %", "0", 100)
+        ttk.Label(fault, text="坏 CRC 仅 RTU / RTU over TCP 生效",
+                  style="Muted.TLabel").grid(row=3, column=0, columnspan=4, sticky="w")
+
+        fault_actions = ttk.Frame(cfg_body, style="Inner.TFrame")
+        fault_actions.pack(fill="x", pady=(8, 0))
+        ttk.Button(fault_actions, text="应用", command=self._apply_faults).pack(side="left")
+        ttk.Button(fault_actions, text="全部清零",
+                   command=self._clear_faults).pack(side="left", padx=(6, 0))
+        self.fault_stat = ttk.Label(cfg_body, text="未注入", style="Muted.TLabel",
+                                    justify="left", wraplength=250)
+        self.fault_stat.pack(anchor="w", pady=(6, 0))
 
         # -- 右：寄存器视图 --
         view_card, view_body = self._card(
@@ -918,10 +1176,12 @@ class ModbusApp:
         ttk.Label(toolbar, text="起始", style="Card.TLabel").pack(side="left", padx=(12, 0))
         self.view_start = ttk.Spinbox(toolbar, from_=0, to=65535, width=7)
         self.view_start.set("0")
+        self._install_input_guard(self.view_start, 65535)
         self.view_start.pack(side="left", padx=(6, 0))
         ttk.Label(toolbar, text="数量", style="Card.TLabel").pack(side="left", padx=(10, 0))
         self.view_count = ttk.Spinbox(toolbar, from_=1, to=500, width=6)
         self.view_count.set("32")
+        self._install_input_guard(self.view_count, 500)
         self.view_count.pack(side="left", padx=(6, 0))
         ttk.Button(toolbar, text="刷新", command=self._refresh_slave_table).pack(side="left", padx=(10, 0))
         ttk.Button(toolbar, text="全部清零", command=self._clear_slave).pack(side="left", padx=(6, 0))
@@ -995,6 +1255,8 @@ class ModbusApp:
         ttk.Label(head, text="通信日志", style="CardTitle.TLabel").pack(side="left")
         ttk.Button(head, text="收起", width=5,
                    command=lambda: self._toggle_log_panel(False)).pack(side="right")
+        ttk.Button(head, text="解析…", width=6,
+                   command=self._open_parser_dialog).pack(side="right", padx=(0, 6))
         self.log_pause_btn = ttk.Button(head, text="暂停", width=5,
                                         command=self._toggle_log_pause)
         self.log_pause_btn.pack(side="right", padx=(0, 6))
@@ -1056,8 +1318,6 @@ class ModbusApp:
         self.log_text.see("end")
 
     def _export_log(self) -> None:
-        import time as _time
-        from tkinter import filedialog
         content = self.log_text.get("1.0", "end").strip("\n")
         if not content:
             self._notify("日志是空的，没有可导出的内容", error=True)
@@ -1065,7 +1325,7 @@ class ModbusApp:
         path = filedialog.asksaveasfilename(
             title="导出日志",
             defaultextension=".txt",
-            initialfile=f"modbus-log-{_time.strftime('%Y%m%d-%H%M%S')}.txt",
+            initialfile=f"modbus-log-{time.strftime('%Y%m%d-%H%M%S')}.txt",
             filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
         )
         if not path:
@@ -1113,6 +1373,13 @@ class ModbusApp:
         self._pool.submit(runner)
 
     def _log(self, text: str, tag: str = "") -> None:
+        # 镜像进滚动文件。挂在 _post 之前：界面「暂停」只停画图，
+        # 文件侧一条不少 —— 事后追查要的正是被暂停遮住的那段。
+        if self.logger is not None:
+            try:
+                self.logger.info("%s", text)
+            except Exception:
+                pass
         self._post("log", text, tag)
 
     def _notify(self, text: str, error: bool = False) -> None:
@@ -1125,7 +1392,6 @@ class ModbusApp:
         self._log(text, "err" if error else "")
 
     def _append_log(self, text: str, tag: str = "") -> None:
-        import time
         if self._log_paused:
             self._log_skipped += 1
             return
@@ -1155,18 +1421,38 @@ class ModbusApp:
 
     # ------------------------------------------------------------ 主站逻辑
 
+    def _on_link_box_selected(self, _event=None) -> None:
+        """下拉框选中 → 先把显示标签换算回内部键，再走统一的切换逻辑。"""
+        self.link_mode.set(LINK_KEYS.get(self.link_box.get(), "tcp"))
+        self._on_link_mode_change()
+
     def _on_link_mode_change(self) -> None:
+        mode = LINK_KEYS.get(self.link_mode.get(), self.link_mode.get())
+        if mode != self.link_mode.get():      # 手滑把显示标签塞进了变量也能归位到键
+            self.link_mode.set(mode)
+        self.link_box.set(LINK_LABELS.get(mode, "TCP"))
         self.tcp_frame.pack_forget()
         self.rtu_frame.pack_forget()
-        if self.link_mode.get() == "tcp":
+        # RTU over TCP 用的是 TCP 链路参数（主机/端口），复用同一组输入框；
+        # 差别只在流里跑的帧格式，由 _build_transport 按模式区分。
+        if mode in ("tcp", "rtutcp"):
             self.tcp_frame.pack(fill="x")
         else:
             self.rtu_frame.pack(fill="x")
 
+    def _on_slave_box_selected(self, _event=None) -> None:
+        self.slave_mode.set(SLAVE_MODE_KEYS.get(self.slave_mode_box.get(), "tcp"))
+        self._on_slave_mode_change()
+
     def _on_slave_mode_change(self) -> None:
+        mode = SLAVE_MODE_KEYS.get(self.slave_mode.get(), self.slave_mode.get())
+        if mode != self.slave_mode.get():
+            self.slave_mode.set(mode)
+        self.slave_mode_box.set(SLAVE_MODE_LABELS.get(mode, "TCP 监听"))
         self.slave_tcp_frame.pack_forget()
         self.slave_rtu_frame.pack_forget()
-        if self.slave_mode.get() == "tcp":
+        # RTU/TCP 透传同样监听 TCP 端口，复用地址/端口输入框
+        if mode in ("tcp", "rtutcp"):
             self.slave_tcp_frame.pack(fill="x")
         else:
             self.slave_rtu_frame.pack(fill="x")
@@ -1174,6 +1460,9 @@ class ModbusApp:
     def _on_fc_change(self) -> None:
         fc = FC_OPTIONS[self.fc_box.current()][1]
         is_read = fc in (1, 2, 3, 4)
+        if self._polling and not is_read:
+            # 轮询只对读码有意义：切到写码立刻停，别等 5 次失败计数慢慢凑
+            self._stop_poll()
         self.read_btn.configure(state="normal" if is_read else "disabled")
         self.write_btn.configure(state="disabled" if is_read else "normal")
         self._prev_cells = None
@@ -1188,7 +1477,11 @@ class ModbusApp:
             self.write_hint.pack(side="left", padx=(0, 10), before=self.read_btn)
             limit = write_limit(fc) or 123
             self.count_var.configure(state="disabled")
-            self._log(f"功能码 {fc:02d} 为写操作，数量由写入值的个数决定（上限 {limit}）")
+            if fc == 22:
+                self._log("掩码写：值填 AND,OR 两个掩码（支持 0x 十六进制），"
+                          "只改 AND 为 0 的那些位")
+            else:
+                self._log(f"功能码 {fc:02d} 为写操作，数量由写入值的个数决定（上限 {limit}）")
         self._preview_write()
 
     def _preview_write(self) -> None:
@@ -1205,6 +1498,11 @@ class ModbusApp:
             label.configure(text="")
             return
         raw = _normalize_number(self.write_var.get())
+        if fc == 22:
+            items = _split_values(raw)
+            label.configure(text="→ 掩码写 1 个寄存器" if len(items) == 2
+                            else "→ 需要两个掩码（AND,OR）")
+            return
         if self._current_dtype() == "ascii":
             if not raw:
                 label.configure(text="—")
@@ -1218,7 +1516,10 @@ class ModbusApp:
             count = (byte_len + 1) // 2
             label.configure(text=f"→ {count} 个寄存器（{count * 2} 字符）")
             return
-        items = [p for p in raw.replace("，", ",").replace("；", ",").split(",") if p.strip()]
+        # 个数统计必须和真正写入时的解析口径一致（parsing.split_values）。
+        # 以前这里只替换全角逗号/分号，漏了顿号和半角分号 —— 填 `1、2、3`
+        # 提示「1 个寄存器」，实际写进去 3 个。
+        items = _split_values(self.write_var.get())
         if not items:
             label.configure(text="—")
             return
@@ -1241,13 +1542,15 @@ class ModbusApp:
             timeout = float(self.timeout_var.get())
         except ValueError:
             raise ValueError("超时时间必须是数字") from None
-        if mode == "tcp":
+        if mode in ("tcp", "rtutcp"):
             host = self.tcp_host.get().strip() or "127.0.0.1"
             try:
                 port = int(self.tcp_port.get())
             except ValueError:
                 raise ValueError("端口必须是整数") from None
-            return TcpTransport(host, port, timeout=timeout)
+            if mode == "tcp":
+                return TcpTransport(host, port, timeout=timeout)
+            return RtuOverTcpTransport(host, port, timeout=timeout)
         if not HAS_SERIAL:
             raise RuntimeError("RTU 模式需要 pyserial：pip install pyserial")
         port = self.rtu_port.get().strip()
@@ -1365,18 +1668,19 @@ class ModbusApp:
             return "操作失败（内部错误），细节已写入日志"
         return text
 
-    def _parse_write_values(self, fc: int) -> list | None:
+    def _parse_write_values(self, fc: int, dtype: str | None = None) -> list | None:
         """解析「写入值」输入框。切分与类型转换见 parsing.parse_write_values。
 
         GUI 只负责把错误变成状态栏提示 —— 早期这里自己切分，分隔符集合
         与 CLI 不一致（少了中文顿号），两边对同一串输入的解释会不一样。
+        dtype 可强制覆盖「数据解释」弹层里选的类型（掩码写固定按整数解析）。
         """
         raw = self.write_var.get().strip()
         if not raw:
             self._notify("请先在「写入值」里填写数据", error=True)
             return None
         try:
-            return parse_write_values(raw, fc, self._current_dtype())
+            return parse_write_values(raw, fc, dtype or self._current_dtype())
         except ValueError as exc:
             self._notify(str(exc), error=True)
             return None
@@ -1443,6 +1747,79 @@ class ModbusApp:
             text = f"FC{fc:02d} 地址 {address} 共 {len(values)} 点{extra}"
         self.master_status.configure(text=text, foreground=MUTED)
         self._refresh_stats()
+        self._csv_record(fc, address, values)
+
+    # -- 设备识别（FC2B）---------------------------------------------------
+
+    def _identify_device_async(self) -> None:
+        """读一次设备标识：厂商名、产品代码、版本号，联调时先确认对面是谁。
+
+        注意 client.read_device_id() 返回的是 {对象号: 值}，名字映射在这边补
+        （core.read_device_id 才返回带 name 字段的结构）。
+        """
+        client = self._require_client()
+        if client is None:
+            return
+        self._begin_request("正在读设备标识…")
+
+        def done(result, error):
+            self._end_request()
+            if error:
+                self._notify(f"设备识别失败：{self._friendly_error(error)}", error=True)
+                self._mark_link(False)
+                self._refresh_stats()
+                return
+            self._mark_link(True)
+            self._refresh_stats()
+            items = " · ".join(
+                f"{DEVICE_ID_OBJECTS.get(oid, f'对象 {oid}')}={value}"
+                for oid, value in sorted(result.items()))
+            latency = client.last_latency_ms
+            extra = f" · {latency:.1f} ms" if latency is not None else ""
+            self.master_status.configure(text=f"设备标识：{items}{extra}", foreground=MUTED)
+            self._log(f"设备识别（FC2B）：{items}{extra}", "ok")
+
+        self._async(lambda: client.read_device_id(), done)
+
+    # -- CSV 记录 ----------------------------------------------------------
+
+    def _toggle_csv(self) -> None:
+        if self._csv is None:
+            path = _default_csv_path()
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                self._csv = _CsvSession(path)
+            except OSError as exc:
+                self._csv = None
+                self.csv_var.set(False)
+                self._notify(f"无法创建 CSV 文件：{exc}", error=True)
+                return
+            self.csv_check.configure(text="记录中…")
+            self._log(f"开始记录 CSV：{path}", "ok")
+            return
+        rows, self._csv = self._csv.rows, None
+        self._csv_close_quiet()
+        self.csv_check.configure(text="记录 CSV")
+        self._log(f"CSV 记录已停止（{rows} 行）", "ok")
+
+    def _csv_close_quiet(self) -> None:
+        if self._csv is not None:
+            self._csv.close()
+            self._csv = None
+
+    def _csv_record(self, fc: int, address: int, values: list) -> None:
+        """读成功后落一行：时间, 功能码, 地址, 各寄存器原始值。"""
+        if self._csv is None or not values:
+            return
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self._csv.write([stamp, f"FC{fc:02d}", address]
+                            + [int(v) for v in values])
+        except (OSError, ValueError) as exc:
+            self._csv_close_quiet()
+            self.csv_var.set(False)
+            self.csv_check.configure(text="记录 CSV")
+            self._log(f"CSV 写入失败，已停止记录：{exc}", "err")
 
     # -- 类型与地址 --------------------------------------------------------
 
@@ -1453,6 +1830,20 @@ class ModbusApp:
     def _current_dtype(self) -> str:
         index = self.dtype_box.current()
         return DTYPE_OPTIONS[index if index >= 0 else 0][1]
+
+    def _current_scale(self) -> float:
+        """系数输入框的容错解析。以前同样的 try/except 抄了 6 处。"""
+        try:
+            return float(self.scale_var.get() or 1)
+        except ValueError:
+            return 1.0
+
+    def _current_bias(self) -> float:
+        """偏移输入框的容错解析，与 core.read/write 的 bias 语义一致。"""
+        try:
+            return float(self.bias_var.get() or 0)
+        except ValueError:
+            return 0.0
 
     def _on_dtype_change(self) -> None:
         # 16 位数值没有字节序可言，把下拉灰掉比留着让人误选更清楚。
@@ -1659,6 +2050,12 @@ class ModbusApp:
         tree = self.result_tree
         tree.delete(*tree.get_children())
         fc = self._current_fc()
+        if fc in (1, 2) and len(values) > MAX_DETAIL_ROWS:
+            # 状态栏照报总点数，表里只画前 MAX_DETAIL_ROWS 行 —— 让界面
+            # 卡死的「功能」比少渲染更糟
+            self._log(f"明细视图只渲染前 {MAX_DETAIL_ROWS} 行（本次读到 {len(values)} 点），"
+                      "大范围请用网格视图或缩小数量", "err")
+            values = values[:MAX_DETAIL_ROWS]
         rows: list[tuple] = []
         cells: list[str] = []
 
@@ -1671,12 +2068,10 @@ class ModbusApp:
         else:
             dtype = self._current_dtype()
             unit = self.unit_text_var.get().strip()
-            try:
-                scale = float(self.scale_var.get() or 1)
-            except ValueError:
-                scale = 1.0
+            scale = self._current_scale()
             step = span(dtype)
-            decoded = decode(values, dtype, self.byteorder_box.get() or "ABCD", scale, 0.0)
+            decoded = decode(values, dtype, self.byteorder_box.get() or "ABCD",
+                             scale, self._current_bias())
             for index, value in enumerate(decoded):
                 start = address + index * step
                 chunk = values[index * step:(index + 1) * step]
@@ -1727,12 +2122,9 @@ class ModbusApp:
 
         # 值：按类型解码；网格里不放单位，纯数字更像仪表
         dtype = self._current_dtype()
-        try:
-            scale = float(self.scale_var.get() or 1)
-        except ValueError:
-            scale = 1.0
         step = span(dtype)
-        decoded = decode(values, dtype, self.byteorder_box.get() or "ABCD", scale, 0.0)
+        decoded = decode(values, dtype, self.byteorder_box.get() or "ABCD",
+                         self._current_scale(), self._current_bias())
         if dtype == "ascii":
             # 一格两个字符，74px 太浪费；左对齐才像字符串
             self._emit_cells(tree, decoded, address, fc, per, 1, 44, "w",
@@ -1859,8 +2251,8 @@ class ModbusApp:
         pad = 3
         data = list(self._trend)
         if len(data) < 2:
-            canvas.create_text(width / 2, height / 2, text="趋势 —",
-                               fill=MUTED, font=("Microsoft YaHei UI", 7))
+            canvas.create_text(width / 2, height / 2, text="点选格子看趋势",
+                               fill=MUTED, font=("Microsoft YaHei UI", 8))
             return
         low, high = min(data), max(data)
         carve = (high - low) or 1.0
@@ -2096,10 +2488,6 @@ class ModbusApp:
                 write_fc = 6
             else:
                 dtype = self._current_dtype()
-                try:
-                    scale = float(self.scale_var.get() or 1)
-                except ValueError:
-                    scale = 1.0
                 # 整数必须先走整数解析：`float(text)` 只有 53 位尾数，
                 # 就地改 uint64/int64 会把低位静默改掉（codec.encode 里
                 # 特意绕开了 float，这里再转一次等于把防护绕过去）。
@@ -2110,7 +2498,8 @@ class ModbusApp:
                     if not math.isfinite(raw_value):
                         raise ValueError("值必须是有限数，NaN / ∞ 不能写入")
                 payload = encode([raw_value], dtype,
-                                 self.byteorder_box.get() or "ABCD", scale, 0.0)
+                                 self.byteorder_box.get() or "ABCD",
+                                 self._current_scale(), self._current_bias())
                 write_fc = 16 if len(payload) > 1 else 6
         except (TypeError, ValueError) as exc:
             self._notify(f"值无效：{exc}", error=True)
@@ -2181,12 +2570,12 @@ class ModbusApp:
         parts = [DTYPE_SHORT.get(dtype, dtype)]
         if span(dtype) > 1:
             parts.append(self.byteorder_box.get() or "ABCD")
-        try:
-            scale = float(self.scale_var.get() or 1)
-        except ValueError:
-            scale = 1.0
+        scale = self._current_scale()
         if scale != 1:
             parts.append(f"×{scale:g}")
+        bias = self._current_bias()
+        if bias:
+            parts.append(("+" if bias > 0 else "-") + f"{abs(bias):g}")
         unit = self.unit_text_var.get().strip()
         if unit:
             parts.append(unit)
@@ -2206,6 +2595,7 @@ class ModbusApp:
             "dtype": self.dtype_box.get(),
             "byteorder": self.byteorder_box.get(),
             "scale": self.scale_var.get(),
+            "bias": self.bias_var.get(),
             "unit": self.unit_text_var.get(),
             "plc": self.plc_var.get(),
         }
@@ -2278,40 +2668,48 @@ class ModbusApp:
         if client is None:
             return
         fc = self._current_fc()
-        if fc not in (5, 6, 15, 16):
+        if fc not in (5, 6, 15, 16, 22):
             self._notify("当前功能码是读操作，请点“读取”", error=True)
             return
-        values = self._parse_write_values(fc)
-        if values is None:
-            return
+        if fc == 22:
+            # 掩码写的两个值是位掩码，固定按整数解析（支持 0x），
+            # 不跟着「数据解释」弹层里选的 float 类型漂
+            values = self._parse_write_values(22, dtype="uint16")
+            if values is None:
+                return
+            if len(values) != 2:
+                self._notify("掩码写需要 AND 和 OR 两个掩码，逗号分隔（如 0xFFF0,0x000F）",
+                             error=True)
+                return
+            payload = [int(v) & 0xFFFF for v in values]
+        else:
+            values = self._parse_write_values(fc)
+            if values is None:
+                return
+            if fc in (5, 6) and len(values) != 1:
+                self._notify("单点写入只能填一个值", error=True)
+                return
+            if fc in (5, 15):
+                payload = values
+            else:
+                # 用户填的是物理量（比如 220.5），这里负责编码成寄存器序列
+                try:
+                    payload = encode(values, self._current_dtype(),
+                                     self.byteorder_box.get() or "ABCD",
+                                     self._current_scale(), self._current_bias())
+                except ValueError as exc:
+                    self._notify(str(exc), error=True)
+                    return
+                if fc == 6 and len(payload) != 1:
+                    self._notify(f"{self._current_dtype()} 要占 {len(payload)} 个寄存器，"
+                                 f"单点写放不下，请改用「写多寄存器」", error=True)
+                    return
         try:
             address = self._resolve_address(
                 self._int_field(self.addr_var, "起始地址", 0, 65535), fc)
         except (ValueError, AddressError) as exc:
             self._notify(f"参数有误：{exc}", error=True)
             return
-        if fc in (5, 6) and len(values) != 1:
-            self._notify("单点写入只能填一个值", error=True)
-            return
-
-        if fc in (5, 15):
-            payload = values
-        else:
-            # 用户填的是物理量（比如 220.5），这里负责编码成寄存器序列
-            try:
-                scale = float(self.scale_var.get() or 1)
-            except ValueError:
-                scale = 1.0
-            try:
-                payload = encode(values, self._current_dtype(),
-                                 self.byteorder_box.get() or "ABCD", scale, 0.0)
-            except ValueError as exc:
-                self._notify(str(exc), error=True)
-                return
-            if fc == 6 and len(payload) != 1:
-                self._notify(f"{self._current_dtype()} 要占 {len(payload)} 个寄存器，"
-                             f"单点写放不下，请改用「写多寄存器」", error=True)
-                return
 
         def done(result, error):
             self._end_request()
@@ -2328,8 +2726,8 @@ class ModbusApp:
             self._log(f"写入成功：地址 {address} ← {self._write_brief(values)} "
                       f"→ {counted} {noun} {self._hex_list(payload)}", "ok")
             self._refresh_stats()
-            self._mark_written(address, len(payload))
-            self._readback(fc, address, len(payload),
+            self._mark_written(address, 1 if fc == 22 else len(payload))
+            self._readback(fc, address, 1 if fc == 22 else len(payload),
                            f"已写入 {counted} {noun}（{bytes_} 字节）")
 
         counted, noun, _ = self._write_extent(fc, len(payload))
@@ -2342,7 +2740,10 @@ class ModbusApp:
 
         线圈按位算字节（8 个一字节），寄存器按 2 字节算 —— 这是 Modbus 帧里
         「字节数」字段的定义，界面上就该用同一套口径说话。
+        掩码写虽然发 AND/OR 两个掩码，落盘的只有 1 个寄存器。
         """
+        if fc == 22:
+            return 1, "个寄存器", 2
         if fc in (5, 15):
             return payload_len, "个线圈", (payload_len + 7) // 8
         return payload_len, "个寄存器", payload_len * 2
@@ -2369,15 +2770,15 @@ class ModbusApp:
             shown = (", ".join(format_value(v, dtype) for v in values[:4])
                      + f" …（共 {len(values)} 个）")
         kind = DTYPE_SHORT.get(dtype, dtype)
-        try:
-            scale = float(self.scale_var.get() or 1)
-        except ValueError:
-            scale = 1.0
         extra = f" {kind}"
         if span(dtype) > 1:
             extra += f" {self.byteorder_box.get() or 'ABCD'}"
+        scale = self._current_scale()
         if scale != 1:
             extra += f" ×{scale:g}"
+        bias = self._current_bias()
+        if bias:
+            extra += (" +" if bias > 0 else " -") + f"{abs(bias):g}"
         return f"{shown}（{extra.strip()}）"
 
     def _readback(self, write_fc: int, address: int, count: int, note: str = "") -> None:
@@ -2481,6 +2882,7 @@ class ModbusApp:
                 self._mark_link(True)
                 if not self._editing:      # 正在就地编辑时别重画，否则输入框会被顶走
                     self._render_values(values, address)
+                self._csv_record(fc, address, values)
                 latency = self.client.last_latency_ms if self.client else None
                 extra = f" · {latency:.1f} ms" if latency is not None else ""
                 self.master_status.configure(
@@ -2508,9 +2910,11 @@ class ModbusApp:
             unit = self._int_field(self.slave_unit, "从站站号", 1, 247)
             size = self._int_field(self.slave_size, "寄存器数量", 1, 65536)
             store = DataStore(size=size)
-            if self.slave_mode.get() == "tcp":
-                server = TcpServer(
-                    host=self.slave_host.get().strip() or "0.0.0.0",
+            if self.slave_mode.get() in ("tcp", "rtutcp"):
+                server_cls = TcpServer if self.slave_mode.get() == "tcp" else RtuOverTcpServer
+                server = server_cls(
+                    # 清空输入框时只听本机，别把寄存器区静默暴露到网段
+                    host=self.slave_host.get().strip() or "127.0.0.1",
                     port=self._int_field(self.slave_port, "监听端口", 0, 65535),
                     store=store, unit=unit, on_log=self._log,
                 )
@@ -2546,9 +2950,74 @@ class ModbusApp:
             self.slave_stat.configure(text=f"运行中 · 端口 {server.port} · 站 {unit}")
             self._log(f"从站已启动（{server.port}）", "ok")
             self.tabs.set_badge(1, True)      # 在「从站」上点一颗绿灯，主站页也看得见它在跑
+            self._clear_faults()              # 新从站的故障注入从零开始，面板跟着归零
             self._refresh_slave_table()
 
         self._async(server.start, done)
+
+    # -- 故障注入 ----------------------------------------------------------
+
+    _FAULT_FIELDS = ("fault_drop", "fault_delay", "fault_exc",
+                     "fault_exc_code", "fault_trunc", "fault_crc")
+
+    def _fault_params(self) -> dict | None:
+        """把面板上的输入换成 FaultConfig 字典；出错返回 None 并提示。"""
+        try:
+            code = int(self.fault_exc_code.get())
+            params = {
+                "drop_rate": float(self.fault_drop.get()) / 100,
+                "delay": max(0.0, float(self.fault_delay.get())) / 1000,
+                "exception_rate": float(self.fault_exc.get()) / 100,
+                "exception_code": code,
+                "truncate_rate": float(self.fault_trunc.get()) / 100,
+                "bad_crc_rate": float(self.fault_crc.get()) / 100,
+            }
+        except ValueError:
+            self.fault_stat.configure(text="故障注入参数必须是数字", foreground=ERR)
+            return None
+        if not 0 <= code <= 255:
+            self.fault_stat.configure(text="异常码必须在 0~255 之间", foreground=ERR)
+            return None
+        return params
+
+    def _apply_faults(self) -> None:
+        if self.server is None:
+            self.fault_stat.configure(text="从站未启动，先启动从站", foreground=ERR)
+            return
+        params = self._fault_params()
+        if params is None:
+            return
+        self.server.core.faults = FaultConfig.from_dict(params)
+        self._render_fault_stat()
+
+    def _clear_faults(self) -> None:
+        if self.server is not None:
+            self.server.core.faults = FaultConfig()
+        for name in self._FAULT_FIELDS:
+            getattr(self, name).set("0")
+        self._render_fault_stat()
+
+    def _render_fault_stat(self) -> None:
+        if self.server is None:
+            self.fault_stat.configure(text="未注入", foreground=MUTED)
+            return
+        faults = self.server.core.faults
+        if not faults.active:
+            self.fault_stat.configure(text="未注入", foreground=MUTED)
+            return
+        parts = []
+        if faults.drop_rate:
+            parts.append(f"丢包 {faults.drop_rate * 100:g}%")
+        if faults.delay:
+            parts.append(f"延迟 {faults.delay * 1000:g}ms")
+        if faults.exception_rate:
+            parts.append(f"异常 {faults.exception_rate * 100:g}%/码0x{faults.exception_code:02X}")
+        if faults.truncate_rate:
+            parts.append(f"截断 {faults.truncate_rate * 100:g}%")
+        if faults.bad_crc_rate:
+            parts.append(f"坏CRC {faults.bad_crc_rate * 100:g}%")
+        self.fault_stat.configure(text="注入中：" + " · ".join(parts), foreground=WARN)
+        self._log("故障注入已更新：" + " · ".join(parts), "ok")
 
     def _current_area(self) -> str:
         return AREA_OPTIONS[self.area_box.current()][1]
@@ -2568,7 +3037,7 @@ class ModbusApp:
 
         # 批量读：一格一次 get() 就是 500 次加锁 + 500 次信号扫描，每 800ms 一轮
         values = store.read_area(area, start, count)
-        is_bit = area in ("coils", "discrete_inputs")
+        is_bit = area in BIT_AREAS
         # 进制只在网格视图有意义；位区 ●/○ 已经是最佳显示，也不参与
         fmt = "" if (is_bit or not self._slave_grid) else self.slave_fmt_box.get()
         self.slave_fmt_box.configure(
@@ -2730,7 +3199,7 @@ class ModbusApp:
         index = self._slave_base + int(row_id) * self._slave_grid_per + col
         if index < self._slave_start:      # 首行左侧的留空格
             return
-        if area in ("coils", "discrete_inputs"):
+        if area in BIT_AREAS:
             initial = "1" if tree.set(row_id, f"c{col}") == "●" else "0"
             fmt = "dec"
         else:
@@ -2780,10 +3249,16 @@ class ModbusApp:
 
     def _apply_cell_edit(self, index: int, text: str, fmt: str = "dec") -> None:
         text = _normalize_number(text)
+        if self.server is None:
+            # 编辑器开着的时候从站被停掉，回车提交会走到这里 —— 直接解引用
+            # self.server.store 会抛 AttributeError，被 Tk 回调钩子当成
+            # 「程序内部错误」报给用户。如实告知即可。
+            self.slave_edit_hint.configure(text="从站已停止，修改未写入", foreground=ERR)
+            return
         area = self._current_area()
         store = self.server.store
         try:
-            if area in ("coils", "discrete_inputs"):
+            if area in BIT_AREAS:
                 value = text.lower() in ("1", "on", "true", "yes", "●")
             elif fmt == "HEX":
                 value = int(text, 16)
@@ -2822,6 +3297,7 @@ class ModbusApp:
 
     def _on_close(self) -> None:
         self._polling = False
+        self._csv_close_quiet()          # 记录中的 CSV 必须关掉，Windows 上留着句柄删不掉
         if self.server is not None:
             try:
                 self.server.stop()
@@ -2844,8 +3320,14 @@ def main() -> None:
     except Exception:
         pass
 
+    # 文件日志默认关闭；崩溃堆栈仍会经 report_callback_exception 提示到界面，
+    # get_logger 每次现取 —— 将来若恢复落盘开关，之后的崩溃也能直接落进文件
     root = tk.Tk()
     app = ModbusApp(root)
+    install_excepthook(root=root, get_logger=lambda: app.logger,
+                       on_crash=lambda message, _detail:
+                       app._notify(f"{message}，详情已打印到控制台",
+                                   error=True))
     root.protocol("WM_DELETE_WINDOW", app._on_close)
     root.mainloop()
 
