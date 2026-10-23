@@ -288,8 +288,8 @@ def cmd_scan(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="modbus",
-        description="轻量级 Modbus 工具：主从一体，TCP / RTU 双模",
+        prog="modnova",
+        description="ModNova —— 轻量级 Modbus 调试工具：主从一体，TCP / RTU 双模",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

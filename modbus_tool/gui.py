@@ -113,7 +113,7 @@ DTYPE_OPTIONS = [
 class ModbusApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Modbus 工具")
+        self.root.title("ModNova")
         # 标题栏/任务栏图标：M 品牌方块。PhotoImage 挂在 self 上防止被回收。
         self._icon_img = tk.PhotoImage(
             master=root, data=base64.b64encode(icon_png()).decode("ascii"))
@@ -384,7 +384,7 @@ class ModbusApp:
         brand = ttk.Frame(header)
         brand.pack(side="left")
         self._brand_mark(brand).pack(side="left", padx=(0, 8))
-        ttk.Label(brand, text="Modbus", style="AppTitle.TLabel").pack(side="left")
+        ttk.Label(brand, text="ModNova", style="AppTitle.TLabel").pack(side="left")
 
         self.tabs = SegmentedTabs(
             header,

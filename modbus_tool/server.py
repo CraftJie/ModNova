@@ -42,7 +42,7 @@ if HAS_SERIAL:
 # 从站默认对外报的身份信息。用 0x2B 能读出来，联调时确认对面是不是自己的模拟器。
 # 版本号取包版本，别在这里另写一个（以前是 V1.3，而包根是 1.4.0）。
 DEFAULT_IDENTITY = {
-    0x00: "Modbus Tool",
+    0x00: "ModNova",
     0x01: "SIM",
     0x02: f"V{_VERSION}",
 }

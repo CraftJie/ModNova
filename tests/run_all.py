@@ -85,7 +85,7 @@ def run_rtu(python: str) -> tuple[bool, str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="跑完 Modbus 工具的全部测试")
+    parser = argparse.ArgumentParser(description="跑完 ModNova 的全部测试")
     parser.add_argument("--logic", action="store_true", help="只跑逻辑测试")
     parser.add_argument("--ui", action="store_true", help="只跑界面测试")
     parser.add_argument("--rtu", action="store_true", help="只跑 RTU 测试")

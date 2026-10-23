@@ -199,7 +199,7 @@ def main() -> int:
         """0x2B 的应答是变长对象列表 —— 帧长没法靠功能码推算，得逐段读。"""
         info = client.read_device_id(1)
         vendor = info.get(0x00, "")
-        return f"厂商={vendor!r} 对象数={len(info)}", vendor == "Modbus Tool" and len(info) >= 3
+        return f"厂商={vendor!r} 对象数={len(info)}", vendor == "ModNova" and len(info) >= 3
 
     case("RTU 设备标识 FC2B", "读到厂商名与版本", device_identification)
 

@@ -1,4 +1,4 @@
-"""轻量级 Modbus 工具 —— 主从一体，TCP / RTU 双模，零第三方依赖（RTU 可选 pyserial）。
+"""ModNova —— 轻量级 Modbus 调试工具，主从一体、TCP / RTU 双模，零第三方依赖（RTU 可选 pyserial）。
 
 分层：
 

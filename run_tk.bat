@@ -1,13 +1,15 @@
 @echo off
 rem Launch the classic Tkinter UI. Requires a Python build that includes tcl/tk.
-rem If auto-detection picks the wrong one, set MODBUS_PYTHON to a suitable python.exe.
+rem If auto-detection picks the wrong one, set MODNOVA_PYTHON to a suitable python.exe.
+rem (MODBUS_PYTHON is still accepted for backward compatibility.)
 
 setlocal
 cd /d "%~dp0"
 
 set "PYEXE="
 set "PYARGS="
-if defined MODBUS_PYTHON if exist "%MODBUS_PYTHON%" set "PYEXE=%MODBUS_PYTHON%"
+if defined MODNOVA_PYTHON if exist "%MODNOVA_PYTHON%" set "PYEXE=%MODNOVA_PYTHON%"
+if not defined PYEXE if defined MODBUS_PYTHON if exist "%MODBUS_PYTHON%" set "PYEXE=%MODBUS_PYTHON%"
 if defined PYEXE goto run
 
 rem uv-managed interpreters usually ship with tcl/tk
@@ -46,7 +48,7 @@ echo.
 echo   [ERROR] No Python with tkinter was found.
 echo.
 echo   Install Python 3.9+ from https://www.python.org/downloads/
-echo   (the official installer bundles tcl/tk), or set MODBUS_PYTHON
+echo   (the official installer bundles tcl/tk), or set MODNOVA_PYTHON
 echo   to a python.exe that can run: import tkinter
 echo.
 pause
@@ -54,6 +56,6 @@ exit /b 1
 
 :run
 echo Using interpreter: %PYEXE% %PYARGS%
-"%PYEXE%" %PYARGS% modbus.py --tk
+"%PYEXE%" %PYARGS% modnova.py --tk
 if errorlevel 1 pause
 exit /b 0

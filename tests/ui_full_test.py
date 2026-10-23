@@ -154,8 +154,8 @@ class Runner:
         app.set_slave_view(False)
 
         # ================= A 启动与导航 =================
-        self.case("A 导航", "窗口标题", "Modbus 工具",
-                  lambda: (self.root.title(), self.root.title() == "Modbus 工具"))
+        self.case("A 导航", "窗口标题", "ModNova",
+                  lambda: (self.root.title(), self.root.title() == "ModNova"))
         self.case("A 导航", "默认页=主站", "主站显示、从站不显示",
                   lambda: (f"主站{bool(app.tab_master.winfo_ismapped())} "
                            f"从站{bool(app.tab_slave.winfo_ismapped())}",

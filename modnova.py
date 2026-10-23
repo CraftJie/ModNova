@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""统一入口。
+"""ModNova 统一入口。
 
-    python modbus.py                     启动界面（Tkinter）
-    python modbus.py read  --tcp ...     命令行读取
-    python modbus.py serve --tcp :5020   以从站方式运行
+    python modnova.py                     启动界面（Tkinter）
+    python modnova.py read  --tcp ...     命令行读取
+    python modnova.py serve --tcp :5020   以从站方式运行
 
 网页版已下线（原 `web.py` + `webui/`），剩下的界面只有 Tk 经典版。
 """
@@ -30,7 +30,7 @@ def main() -> int:
             # 当前解释器没带 tcl/tk（很多精简版 Python 就是这样）。
             # 直接抛 ModuleNotFoundError 的话，用户只会看到一段回溯。
             print(f"当前 Python 无法加载界面（{exc}）。", file=sys.stderr)
-            print("请用 run_tk.bat 启动，或用 MODBUS_PYTHON 指定一个带 tkinter 的解释器。",
+            print("请用 run_tk.bat 启动，或用 MODNOVA_PYTHON 指定一个带 tkinter 的解释器。",
                   file=sys.stderr)
             return 1
 

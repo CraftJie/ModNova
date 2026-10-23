@@ -1,4 +1,4 @@
-# Modbus 工具
+# ModNova
 
 主从一体、TCP / RTU 双模的轻量级 Modbus 调试工具。界面是 Tkinter 单窗口桌面程序，
 协议内核只用标准库 —— 只有 RTU 串口模式需要 `pyserial`。
@@ -180,21 +180,25 @@
 
 ```bash
 run_tk.bat                 # 双击启动（自动找一个带 tkinter 的解释器）
-python modbus.py           # 同上
-python modbus.py read --tcp 192.168.1.10 --fc 3 --addr 0 --count 4 \
+python modnova.py          # 同上
+python modnova.py read --tcp 192.168.1.10 --fc 3 --addr 0 --count 4 \
     --type float32 --byteorder CDAB --unit-label ℃
-python modbus.py read --tcp 192.168.1.10 --fc 3 --addr 40001 --count 4 --plc
-python modbus.py serve --tcp 0.0.0.0:5020 --unit 1 --init 100,200,300
+python modnova.py read --tcp 192.168.1.10 --fc 3 --addr 40001 --count 4 --plc
+python modnova.py serve --tcp 0.0.0.0:5020 --unit 1 --init 100,200,300
+
+# 装了包之后也可以直接用命令名
+pip install -e ".[rtu]"
+modnova ports
 ```
 
 `run_tk.bat` 会自己找一个能 `import tkinter` 的解释器（先扫 uv 装的，再扫 PATH 上的
-python / py）；找到的不对就用 `MODBUS_PYTHON` 环境变量指定。
+python / py）；找到的不对就用 `MODNOVA_PYTHON` 环境变量指定（旧名 `MODBUS_PYTHON` 仍兼容）。
 
 ## 目录结构
 
 ```
-modbus/
-├── modbus.py                 统一入口（默认界面 / CLI）
+ModNova/
+├── modnova.py                统一入口（默认界面 / CLI）
 ├── run_tk.bat                启动器（自动找带 tkinter 的解释器）
 ├── modbus_tool/
 │   ├── crc.py                CRC16（查表法）
@@ -343,11 +347,11 @@ python -m unittest discover -s tests -v
 同时最多接 8 条连接（每连接一个线程），超了会在日志里写「连接数已达上限」。
 
 **串口打不开。** 多半被别的程序占用（组态软件、串口助手），关掉对方再试。
-RTU 需要 `pip install pyserial`，TCP 不需要。`python modbus.py ports` 列出本机串口。
+RTU 需要 `pip install pyserial`，TCP 不需要。`python modnova.py ports` 列出本机串口。
 老仪表如果是 7 数据位（7E1），在链路卡里把「数据位」改成 7。
 
 **双击 `run_tk.bat` 黑窗口一闪就没了。** 双击启动用的是**系统 PATH**，和开发终端里的
-PATH 不是一回事。启动器不依赖 PATH，而是按顺序直接探测：`MODBUS_PYTHON` → uv 装的
+PATH 不是一回事。启动器不依赖 PATH，而是按顺序直接探测：`MODNOVA_PYTHON` → uv 装的
 `cpython-*` → WorkBuddy 自带的解释器 → PATH（跳过微软商店的 `WindowsApps` 占位符）→ `py`。
 全部失败时会停住并打印提示，不会一闪而过。
 
