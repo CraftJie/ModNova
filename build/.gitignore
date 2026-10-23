@@ -4,3 +4,4 @@ build/work/
 build/version_info.txt
 build/certs/
 *.pfx
+ModNova.spec
