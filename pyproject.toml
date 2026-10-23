@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modbus-tool"
+description = "主从一体、TCP / RTU 双模的轻量级 Modbus 调试工具（Tkinter 界面 + CLI）"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+# 协议内核只用标准库；串口是可选能力（见 [rtu]）。
+dependencies = []
+dynamic = ["version"]
+
+[project.optional-dependencies]
+rtu = ["pyserial>=3.5"]
+# 开发/校验用：pip install -e ".[dev,rtu]"
+dev = ["ruff>=0.6", "mypy>=1.10"]
+
+[project.scripts]
+modbus-tool = "modbus_tool.cli:main"
+
+[tool.setuptools]
+packages = ["modbus_tool"]
+
+[tool.setuptools.dynamic]
+version = {attr = "modbus_tool.__version__"}
+
+# ---- 静态检查（ruff 未安装时这些配置不生效，不影响运行）----
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+
+[tool.ruff.lint]
+# E/W: pycodestyle, F: pyflakes, I: import 排序, B: bugbear, UP: pyupgrade
+select = ["E", "W", "F", "I", "B", "UP"]
+ignore = [
+    "E501",   # 行宽由 formatter 负责，这里只做提示性约束
+    "UP038",  # isinstance 的 X | Y 写法要求 3.10+，本项目兼容 3.9
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试脚本里有大量「先建对象再断言」的长函数，允许更松的写法
+"tests/*.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_unused_ignores = true
+warn_redundant_casts = true
+# pyserial 是可选依赖，没有类型存根；没有它时 HAS_SERIAL 为 False
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Tkinter 的控件属性是动态挂上去的（如 tree._grid_signature），不强制类型
+module = "modbus_tool.gui"
+disallow_untyped_defs = false

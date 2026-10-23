@@ -1,0 +1,6 @@
+# TCP 模式完全不需要第三方库。
+# 只有 RTU（串口）模式才需要 pyserial：
+#     pip install pyserial
+# 装了包之后也可以用可选依赖：
+#     pip install -e ".[rtu]"
+pyserial>=3.5
