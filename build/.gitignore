@@ -1,0 +1,6 @@
+# ModNova 构建产物不入库
+build/dist/
+build/work/
+build/version_info.txt
+build/certs/
+*.pfx

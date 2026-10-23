@@ -142,6 +142,7 @@ ModNova/
 │   ├── config.py             配置持久化与预设
 │   ├── cli.py                命令行
 │   └── gui.py                Tkinter 界面
+├── build/                    打包脚本（PyInstaller + 自签代码签名），产物不入库
 ├── pyproject.toml            打包元数据 + 可选依赖 [rtu]、lint/类型检查配置
 └── tests/                    184 项逻辑（unittest）+ 75 项界面 + 9 项 RTU（脚本）
 ```
@@ -208,6 +209,30 @@ python -m unittest discover -s tests -v        # 逻辑 184 项
 逻辑测试分五个文件：协议、类型与地址、应用层（真起从站走完整链路）、新能力、
 回归（`test_regressions.py`，锁住每次审查修掉的具体缺陷）。界面测试按「用户会做的
 每个动作」跑，每条用例同时断言界面文字、日志内容和从站内存里的真实值。
+
+## 从源码打包成 exe
+
+仓库自带构建脚本（产物不入库）：
+
+```bash
+python -m venv build/.venv
+build\.venv\Scripts\pip install -r build/requirements-build.txt
+build\.venv\Scripts\python build/build.py     # 产出 build/dist/ModNova/ 与 zip 便携包
+```
+
+构建结果：`build/dist/ModNova/`（目录版，冷启动约 0.26 s）与
+`build/dist/ModNova-<版本>-win-x64.zip`（约 12 MB，内含 zlib 压缩）。
+exe 的版本资源（文件属性里的 ProductVersion 等）自动取自 `modbus_tool.__version__`。
+
+`build/sign.ps1` 用**自签代码签名证书**（开源项目通行做法）给 exe 做 Authenticode
+签名，并附 RFC 3161 时间戳 —— 证书过期后签名仍然有效。证书和口令只存在本地
+`build/certs/`（已 gitignore），不会进仓库：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build/sign.ps1 -Action create -Password <口令>
+powershell -ExecutionPolicy Bypass -File build/sign.ps1 -Action sign `
+    -Password <口令> -Files build/dist/ModNova/ModNova.exe
+```
 
 ## 常见问题
 

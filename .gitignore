@@ -2,10 +2,16 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-build/
-dist/
 .venv/
 venv/
+
+# 打包产物与签名材料（build/ 目录本身入库：含构建与签名脚本）
+build/dist/
+build/work/
+build/version_info.txt
+build/certs/
+*.pfx
+dist/
 
 # 运行期产物
 tests/_ui_report.json
