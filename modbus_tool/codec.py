@@ -119,10 +119,6 @@ def _reorder(raw: bytes, order: ByteOrder) -> bytes:
     raise ValueError(f"未知字节序 {order}")
 
 
-def is_ascii(dtype: DataType | str) -> bool:
-    return DataType(dtype) is DataType.ASCII
-
-
 NONPRINT = "\u00b7"      # 「·」：不可打印字节的占位符
 
 
@@ -216,6 +212,18 @@ def _register_bytes(value) -> bytes:
     return number.to_bytes(2, "big")
 
 
+def _check_scale(scale: float) -> None:
+    """scale=0 无物理意义，必须显式拒绝。
+
+    decode 侧 `value * 0 + bias` 会把所有读数**静默归零**，看起来像
+    「设备读不到数据」；encode 侧 `(value - bias) / scale` 直接抛
+    ZeroDivisionError，而界面只捕 ValueError，用户看到的是
+    「操作失败（内部错误）」。两条路都远不如一句中文报错。
+    """
+    if scale == 0:
+        raise ValueError("系数不能为 0：读数会全部归零，写入无法反推原始值，请检查「× 系数」输入框")
+
+
 def decode(
     registers: list[int],
     dtype: DataType | str = DataType.UINT16,
@@ -229,6 +237,7 @@ def decode(
     剩下的那个半边值没有意义，硬拼出来只会误导。
     """
     dtype = DataType(dtype)
+    _check_scale(float(scale))
     if dtype is DataType.ASCII:
         return decode_ascii(registers, byteorder)
     order = ByteOrder(byteorder)
@@ -260,6 +269,7 @@ def encode(
     会得到 `"220.5"` 的三个寄存器 —— 看着能用，实际是错的数据。
     """
     dtype = DataType(dtype)
+    _check_scale(float(scale))
     if dtype is DataType.ASCII:
         if isinstance(values, str):
             return encode_ascii(values, byteorder)

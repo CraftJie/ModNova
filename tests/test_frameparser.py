@@ -124,5 +124,30 @@ class TestPduFields(unittest.TestCase):
         self.assertIn("功能码 0x03", joined)       # 照样拆出字段，只是带着警告
 
 
+class TestGroupedHexInput(unittest.TestCase):
+    """2026-10-24 规范评审 P0-1 回归：4 位一组的 hex 段曾被静默截断。
+
+    旧实现 int(part,16) 后 &0xFF，把 "01 03 1234" 解析成 01 03 34 ——
+    高位字节悄悄丢掉。Wireshark 的 data 列和设备手册常按两位一组书写，
+    报文解析器必须把它们当作独立的字节序列对待。
+    """
+
+    def test_grouped_hex_chunks_into_bytes(self):
+        from modbus_tool.frameparser import _hex_to_bytes
+        self.assertEqual(_hex_to_bytes("01 03 1234").hex(" "), "01 03 12 34")
+        self.assertEqual(_hex_to_bytes("0103 0000").hex(" "), "01 03 00 00")
+        self.assertEqual(_hex_to_bytes("0x01,0x03").hex(" "), "01 03")  # 原有宽容行为不回退
+
+    def test_grouped_frame_parses_correctly(self):
+        # 把一帧合法的 FC06 写请求按两位一组重新断行，CRC 仍须通过、字段不变形
+        frame = append_crc(bytes([1, 0x06, 0x00, 0x05, 0xBE, 0xEF]))
+        paired = " ".join(frame[i:i + 2].hex().upper() for i in range(0, len(frame), 2))
+        self.assertNotEqual(paired, hexs(frame))     # 确认测试输入确实是分组形态
+        joined = "\n".join(parse_frame(paired))
+        self.assertIn("CRC 正确", joined)
+        self.assertIn("寄存器地址 5", joined)
+        self.assertIn("0xBEEF", joined)
+
+
 if __name__ == "__main__":
     unittest.main()

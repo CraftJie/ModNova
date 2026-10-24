@@ -298,6 +298,13 @@ def cmd_scan(args) -> int:
     return 0
 
 
+def cmd_ports(_args) -> int:
+    """列出本机串口。以前写成一行 lambda 里塞元组取下标的技巧，可读性差。"""
+    ports = list_serial_ports()
+    print("\n".join(ports) or "未发现串口")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="modnova",
@@ -353,7 +360,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.set_defaults(func=cmd_scan)
 
     p_ports = sub.add_parser("ports", help="列出本机串口")
-    p_ports.set_defaults(func=lambda args: (print("\n".join(list_serial_ports()) or "未发现串口"), 0)[1])
+    p_ports.set_defaults(func=cmd_ports)
 
     return parser
 

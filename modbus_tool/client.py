@@ -74,9 +74,18 @@ class ModbusClient:
         if self.on_log:
             self.on_log(text)
 
-    def _bump(self, name: str, n: int = 1) -> None:
+    def _bump(self, counter: str) -> None:
+        """线程安全地累加计数器。
+
+        成功路径的累加发生在传输锁之外，两个线程同时成功时 `+=` 在
+        字节码层面不是原子的，必须进 `_stat_lock`。
+        显式分支而不是 setattr/getattr 拼属性名：IDE 跳转和重构工具都跟得住。
+        """
         with self._stat_lock:
-            setattr(self, name, getattr(self, name) + n)
+            if counter == "request_count":
+                self.request_count += 1
+            else:
+                self.error_count += 1
 
     def _exchange(self, pdu: bytes) -> bytes:
         """发一帧收一帧，带重试和站号校验，返回原始响应 PDU。"""

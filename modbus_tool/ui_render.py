@@ -74,6 +74,31 @@ def fill_rows(buf, ss: int, width: int, x1, y1, x2, y2, r, color: str) -> None:
             buf[row_index][start * 4:end * 4] = bytes((*rgb, 255)) * (end - start)
 
 
+def _downsample(buf: list[bytearray], ss: int, w: int, h: int) -> bytes:
+    """ss×ss 超采样缓冲缩回 1×：逐点对 ss² 个采样求平均得到抗锯齿结果。
+
+    render_rounded 和 icon_png 用同一套「超采样 → 缩小平均」的流水线，
+    这段循环原来抄了两份 —— 收进来之后两边的缩放算法才不会各自漂移。
+    """
+    out = bytearray(w * h * 4)
+    n = ss * ss
+    for y in range(h):
+        for x in range(w):
+            r_ = g_ = b_ = a_ = 0
+            for dy in range(ss):
+                row = buf[y * ss + dy]
+                base_i = (x * ss) * 4
+                for dx in range(ss):
+                    i = base_i + dx * 4
+                    r_ += row[i]
+                    g_ += row[i + 1]
+                    b_ += row[i + 2]
+                    a_ += row[i + 3]
+            o = (y * w + x) * 4
+            out[o:o + 4] = bytes((r_ // n, g_ // n, b_ // n, a_ // n))
+    return bytes(out)
+
+
 def render_rounded(w: int, h: int, r: int, fill: str, edge: str | None = None,
                     shadow: str | None = None, base: str = "#ffffff",
                     ss: int = 4) -> bytes:
@@ -91,23 +116,7 @@ def render_rounded(w: int, h: int, r: int, fill: str, edge: str | None = None,
     else:
         fill_rows(buf, ss, w, 0, 0, w, h, r, fill)
 
-    out = bytearray(w * h * 4)
-    n = ss * ss
-    for y in range(h):
-        for x in range(w):
-            r_, g_, b_, a_ = 0, 0, 0, 0
-            for dy in range(ss):
-                row = buf[y * ss + dy]
-                base_i = (x * ss) * 4
-                for dx in range(ss):
-                    i = base_i + dx * 4
-                    r_ += row[i]
-                    g_ += row[i + 1]
-                    b_ += row[i + 2]
-                    a_ += row[i + 3]
-            o = (y * w + x) * 4
-            out[o:o + 4] = bytes((r_ // n, g_ // n, b_ // n, a_ // n))
-    return bytes(out)
+    return _downsample(buf, ss, w, h)
 
 
 def png_rgba(w: int, h: int, rgba: bytes) -> bytes:
@@ -165,19 +174,4 @@ def icon_png(size: int = 32) -> bytes:
                 o = bx * 4
                 row[o:o + 4] = white
 
-    out = bytearray(size * size * 4)
-    n2 = ss * ss
-    for y in range(size):
-        for x in range(size):
-            r_ = g_ = b_ = a_ = 0
-            for dy in range(ss):
-                row = buf[y * ss + dy]
-                for dx in range(ss):
-                    i = (x * ss + dx) * 4
-                    r_ += row[i]
-                    g_ += row[i + 1]
-                    b_ += row[i + 2]
-                    a_ += row[i + 3]
-            o = (y * size + x) * 4
-            out[o:o + 4] = bytes((r_ // n2, g_ // n2, b_ // n2, a_ // n2))
-    return png_rgba(size, size, bytes(out))
+    return png_rgba(size, size, _downsample(buf, ss, size, size))

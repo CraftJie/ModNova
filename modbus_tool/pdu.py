@@ -150,13 +150,6 @@ def write_limit(fc: int) -> int | None:
     return WRITE_LIMIT.get(fc)
 
 
-def limit_of(fc: int) -> int | None:
-    """按功能码给出数量上限（读或写）。0x17 读写复合取读区上限。"""
-    if fc == FC.READ_WRITE_MULTIPLE_REGISTERS:
-        return MAX_RW_READ_REGS
-    return READ_LIMIT.get(fc) or WRITE_LIMIT.get(fc)
-
-
 @dataclass
 class Request:
     """一个请求。读操作用 address/count；写操作用 address/values。
@@ -502,6 +495,14 @@ def unpack_response(pdu: bytes, request: Request) -> Response:
         # 从站行为异常。此前只有 MASK_WRITE 分支做了校验，FC05/06 漏了。
         if address != request.address:
             raise ModbusError(ExceptionCode.SERVER_DEVICE_FAILURE, "写回显地址不符")
+        # 值回显同理：FC05 应回 0xFF00/0x0000，FC06 原值回传。值对不上与
+        # 地址对不上的病因相同（流错位 / 从站异常），越早报错越好。
+        if request.values:
+            want = (0xFF00 if request.values[0] else 0x0000) \
+                if fc == FC.WRITE_SINGLE_COIL else int(request.values[0])
+            if value != want:
+                raise ModbusError(ExceptionCode.SERVER_DEVICE_FAILURE,
+                                  f"写回显值不符：期望 0x{want:04X}，收到 0x{value:04X}")
         return Response(fc, [value], address, 1)
 
     if fc in (FC.WRITE_MULTIPLE_COILS, FC.WRITE_MULTIPLE_REGISTERS):

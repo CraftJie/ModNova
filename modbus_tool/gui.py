@@ -958,13 +958,14 @@ class ModbusApp:
         self.parser_output.tag_configure("err", foreground=ERR)
         self.parser_output.configure(state="disabled")
 
-    def _open_parser_dialog(self) -> None:
-        if not getattr(self, "_parser_dialog", None) or not self._parser_dialog.winfo_exists():
-            self._build_parser_dialog()
-        self._toggle_log_panel(True)
-        win = self._parser_dialog
+    def _present_dialog(self, win) -> None:
+        """把一个 Toplevel 按主窗口居中偏上摆好、置顶并接管模态。
+
+        报文解析弹窗与字段视图弹窗原来各抄了一份 —— 居中算法改一次要改两处。
+        """
         win.deiconify()
         win.update_idletasks()
+        # 跟着主窗口居中偏上，别弹到屏幕左上角去（以前固定落在 8,31）
         x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_reqwidth()) // 2
         y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_reqheight()) // 3
         win.geometry(f"+{max(0, x)}+{max(0, y)}")
@@ -974,6 +975,12 @@ class ModbusApp:
             win.grab_set()
         except tk.TclError:
             pass
+
+    def _open_parser_dialog(self) -> None:
+        if not getattr(self, "_parser_dialog", None) or not self._parser_dialog.winfo_exists():
+            self._build_parser_dialog()
+        self._toggle_log_panel(True)
+        self._present_dialog(self._parser_dialog)
 
     def _close_parser_dialog(self) -> None:
         dialog = getattr(self, "_parser_dialog", None)
@@ -988,19 +995,7 @@ class ModbusApp:
         if not self._view_dialog.winfo_exists():
             self._build_view_dialog()      # 极端情况下窗口被系统销毁过，重建一个
         self._sync_addr_mode()         # 界面上的单选要和实际生效的记法一致
-        win = self._view_dialog
-        win.deiconify()
-        win.update_idletasks()
-        # 跟着主窗口居中偏上，别弹到屏幕左上角去（以前固定落在 8,31）
-        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_reqwidth()) // 2
-        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_reqheight()) // 3
-        win.geometry(f"+{max(0, x)}+{max(0, y)}")
-        win.lift()
-        win.focus_force()
-        try:
-            win.grab_set()
-        except tk.TclError:
-            pass
+        self._present_dialog(self._view_dialog)
 
     def _addr_mode_changed(self) -> None:
         """用户点了某一种地址记法 —— 单选按钮唯一的一次写入口。"""
@@ -1832,17 +1827,40 @@ class ModbusApp:
         return DTYPE_OPTIONS[index if index >= 0 else 0][1]
 
     def _current_scale(self) -> float:
-        """系数输入框的容错解析。以前同样的 try/except 抄了 6 处。"""
+        """系数输入框的容错解析。以前同样的 try/except 抄了 6 处。
+
+        无效**或为 0** 都回退 1.0 并记一条日志：0 是合法 float 却无物理意义
+        （decode 全归零、encode 除零），静默放行会伪装成「设备读不到数据」。
+        轮询时这个方法每个周期都会被调到，所以只在输入内容变化时提示一次。
+        """
+        raw = self.scale_var.get()
         try:
-            return float(self.scale_var.get() or 1)
+            value = float(raw or 1)
         except ValueError:
-            return 1.0
+            value = 1.0
+            reason = f"系数「{raw}」不是数字，已按 1 处理"
+        else:
+            if value != 0:
+                return value
+            reason = "系数不能为 0（读数会全部归零），已按 1 处理"
+        if raw != getattr(self, "_scale_warned_raw", None):
+            self._scale_warned_raw = raw
+            self._log(reason, "err")
+        return 1.0
 
     def _current_bias(self) -> float:
-        """偏移输入框的容错解析，与 core.read/write 的 bias 语义一致。"""
+        """偏移输入框的容错解析，与 core.read/write 的 bias 语义一致。
+
+        bias=0 是合法值（无偏移），这里只拦「不是数字」；同样按输入内容
+        节流提示，避免轮询时刷屏。
+        """
+        raw = self.bias_var.get()
         try:
-            return float(self.bias_var.get() or 0)
+            return float(raw or 0)
         except ValueError:
+            if raw != getattr(self, "_bias_warned_raw", None):
+                self._bias_warned_raw = raw
+                self._log(f"偏移量「{raw}」不是数字，已按 0 处理", "err")
             return 0.0
 
     def _on_dtype_change(self) -> None:
@@ -2151,7 +2169,8 @@ class ModbusApp:
         self._grid_pad = pad
         structure_changed = self._setup_grid(tree, per, width, anchor)
         labels = [self._addr_text(base + r * per * step, fc) for r in range(rows)]
-        self._emit_grid_rows(tree, per, cells, labels, structure_changed)
+        self._diff_fill_grid(tree, per, cells, labels, structure_changed,
+                             mark_changes=True)
 
     def _setup_grid(self, tree, per: int, width: int, anchor: str) -> bool:
         """按进制重排网格列：第 0 列是行头地址，其后 per 个数据格。
@@ -2176,15 +2195,20 @@ class ModbusApp:
             tree.column(f"c{i}", width=width, minwidth=40, anchor=anchor, stretch=True)
         return True
 
-    def _emit_grid_rows(self, tree, per: int, cells: list, labels: list,
-                        structure_changed: bool = False) -> None:
-        """一维 cell 序列切成每行 per 格。
+    def _diff_fill_grid(self, tree, per: int, cells: list, labels: list,
+                        structure_changed: bool = False,
+                        mark_changes: bool = False) -> None:
+        """主站/从站网格共用的落表算法：一维 cell 序列切成每行 per 格。
 
-        行数没变时只改变化的格子（`tree.set`）：轮询时整表 delete+insert
+        行集合没变时只改变化的格子（`tree.set`）：轮询时整表 delete+insert
         会把选中行、滚动位置和列宽一起丢掉，值没变也是满屏重排。
+        mark_changes=True（主站侧）时对比上一轮的值，变过的格子打 chg 标签
+        并做高亮渐隐；从站网格没有「上一轮」可比，恒为 False。
+        落表手法原来两边各抄一份 —— 只要有一边改动，两个网格的表现就会
+        慢慢不一样，所以收敛到这里。
         """
         rows = (len(cells) + per - 1) // per
-        changed = self._change_flags([str(c) for c in cells])
+        changed = self._change_flags([str(c) for c in cells]) if mark_changes else []
         existing = tree.get_children()
         same_shape = (not structure_changed and len(existing) == rows
                       and list(existing) == [str(r) for r in range(rows)])
@@ -2199,6 +2223,8 @@ class ModbusApp:
                     want = str(cells[pos]) if pos < len(cells) else ""
                     if tree.set(iid, f"c{c}") != want:
                         tree.set(iid, f"c{c}", want)
+                if not mark_changes:
+                    continue
                 tags = []
                 if any(changed[r * per:(r + 1) * per]):
                     tags.append("chg")
@@ -2214,7 +2240,7 @@ class ModbusApp:
                 chunk = cells[r * per:(r + 1) * per]
                 chunk += [""] * (per - len(chunk))
                 tags = []
-                if any(changed[r * per:(r + 1) * per]):
+                if mark_changes and any(changed[r * per:(r + 1) * per]):
                     tags.append("chg")
                 if r % 2:
                     tags.append("odd")
@@ -2222,7 +2248,7 @@ class ModbusApp:
                             tags=tuple(tags))
             tree.yview_moveto(keep_y)
             tree.xview_moveto(keep_x)
-        if any(changed):
+        if mark_changes and any(changed):
             self._schedule_fade(tree)
 
     # -- 迷你趋势条 -------------------------------------------------------
@@ -3112,30 +3138,8 @@ class ModbusApp:
         self._setup_grid(tree, per, width, anchor)
 
         rows = (len(cells) + per - 1) // per
-        existing = tree.get_children()
-        same_rows = [str(r) for r in range(rows)]
-        if list(existing) == same_rows:
-            # 行集合没变：只原地改有变化的格子，不闪屏、不丢滚动位置
-            for r in range(rows):
-                iid = same_rows[r]
-                want_addr = str(base + r * per)
-                if tree.set(iid, "addr") != want_addr:
-                    tree.set(iid, "addr", want_addr)
-                for c in range(per):
-                    pos = r * per + c
-                    want = cells[pos] if pos < len(cells) else ""
-                    if tree.set(iid, f"c{c}") != want:
-                        tree.set(iid, f"c{c}", want)
-        else:
-            keep = tree.yview()[0]
-            tree.delete(*existing)
-            for r in range(rows):
-                chunk = cells[r * per:(r + 1) * per]
-                chunk += [""] * (per - len(chunk))
-                tree.insert("", "end", iid=str(r),
-                            values=(str(base + r * per), *chunk),
-                            tags=("odd",) if r % 2 else ())
-            tree.yview_moveto(keep)
+        self._diff_fill_grid(tree, per, cells,
+                             [str(base + r * per) for r in range(rows)])
 
     def _tick_slave_refresh(self) -> None:
         # 没起从站就什么都不用采；页签不在前台也不必刷新。
@@ -3145,8 +3149,10 @@ class ModbusApp:
         if self.slave_grid.winfo_ismapped() or self.slave_tree.winfo_ismapped():
             try:
                 self._refresh_slave_table()
-            except Exception:
-                pass
+            except Exception as exc:
+                # 静默吞掉会把真实缺陷变成「从站页永远不刷新」且无人察觉，
+                # 与 applog「崩溃必须留痕」的项目纪律相悖 —— 至少留一行日志。
+                self._log(f"从站数据刷新失败：{exc}", "err")
         self.root.after(800, self._tick_slave_refresh)
 
     def _tick_demo(self) -> None:
@@ -3159,8 +3165,10 @@ class ModbusApp:
                 store.set("input_registers", 2, self._demo_counter % 2)
                 store.set("coils", 0, self._demo_counter % 6 < 3)
                 store.set("discrete_inputs", 1, self._demo_counter % 10 < 5)
-            except Exception:
-                pass
+            except Exception as exc:
+                # 演示数据写不进去属于意外缺陷，静默循环吞掉的话从站页会
+                # 停在旧值上，看起来像「模拟器坏了」却查不到原因
+                self._log(f"演示数据写入失败：{exc}", "err")
         self.root.after(250, self._tick_demo)
 
     def _begin_cell_edit(self, event) -> None:

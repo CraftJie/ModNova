@@ -199,7 +199,10 @@ class TcpTransport(Transport):
                 if tid == self._tid:
                     self._emit("rx", unit, header + body)
                     return unit, body
-                # 事务号不符，说明是上一条超时请求迟到的应答，丢弃后继续等
+                # 事务号不符，说明是上一条超时请求迟到的应答，丢弃后继续等。
+                # 丢弃前先落报文日志：排查「上一条为什么超时」时，这些迟到帧
+                # 恰恰是最直接的证据 —— 不留档的话，超时永远无从对证。
+                self._emit("rx", unit, header + body)
                 if time.monotonic() > deadline:
                     raise TimeoutError("未收到事务号匹配的响应")
 

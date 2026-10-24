@@ -403,6 +403,37 @@ class TestHalfFrameTimeout(unittest.TestCase):
         self.assertFalse(t.connected)
 
 
+class TestStaleTidFrameLogged(unittest.TestCase):
+    """2026-10-24 规范评审 P2-2：事务号不符的迟到应答此前不进报文日志。
+
+    排查「上一条为什么超时」时，迟到帧恰恰是最直接的证据 ——
+    丢弃前必须先 _emit 留档，否则超时永远无从对证。
+    """
+
+    def test_stale_frame_emitted_before_discard(self):
+        a, b = socket.socketpair()
+        t = TcpTransport("127.0.0.1", 502, timeout=1.0)
+        t._sock = a                    # 不真连：直接把 socketpair 一端塞给它
+        t._tid = 5
+        seen: list[tuple[str, int, bytes]] = []
+        t.set_tap(lambda direction, unit, frame: seen.append((direction, unit, frame)))
+
+        stale = struct.pack(">HHHB", 1, 0, 5, 1) + b"\x03\x02\x12\x34"
+        fresh = struct.pack(">HHHB", 5, 0, 5, 1) + b"\x03\x02\x12\x34"
+        b.sendall(stale + fresh)
+        try:
+            unit, body = t.recv()
+        finally:
+            b.close()
+            t.close()
+
+        self.assertEqual((unit, body), (1, b"\x03\x02\x12\x34"))
+        # 修之前 tap 只记匹配帧（1 条）；修之后迟到帧也留下证据（2 条）
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all(direction == "rx" for direction, _u, _f in seen))
+        self.assertEqual(seen[0][2][0:2], b"\x00\x01")     # 迟到帧的事务号 1
+
+
 class TestEmptyHostFallback(unittest.TestCase):
     """P0-2：监听地址留空一律回退 127.0.0.1，绝不静默绑 0.0.0.0。"""
 
@@ -627,6 +658,46 @@ class TestWriteEchoAddress(unittest.TestCase):
 
         client = ModbusClient(transport, unit=1, retries=0)
         client.transport.recv = corrupt_echo  # type: ignore[method-assign]
+        with self.assertRaises(ModbusError):
+            client.write(6, 7, [123])
+
+
+class TestWriteEchoValue(unittest.TestCase):
+    """2026-10-24 规范评审 P1-3：FC05/06 的**值**回显此前没有校验。
+
+    地址对得上、值对不上，病因相同（流错位 / 从站行为异常）—— 照单全收
+    会让用户以为写成功了。FC05 回显 0xFF00/0x0000，FC06 原值回传。
+    """
+
+    def test_register_value_echo_mismatch_rejected(self):
+        request = Request(FC.WRITE_SINGLE_REGISTER, 7, 1, [123])
+        with self.assertRaises(ModbusError) as ctx:
+            unpack_response(struct.pack(">BHH", 6, 7, 124), request)
+        self.assertIn("写回显值不符", str(ctx.exception))
+
+    def test_coil_value_echo_mismatch_rejected(self):
+        # 写 ON(0xFF00) 却回 OFF(0x0000)：地址一致也不能收
+        request = Request(FC.WRITE_SINGLE_COIL, 3, 1, [1])
+        with self.assertRaises(ModbusError):
+            unpack_response(struct.pack(">BHH", 5, 3, 0x0000), request)
+
+    def test_value_echo_ok_passes(self):
+        resp = unpack_response(struct.pack(">BHH", 5, 3, 0xFF00),
+                               Request(FC.WRITE_SINGLE_COIL, 3, 1, [1]))
+        self.assertEqual((resp.address, resp.values), (3, [0xFF00]))
+
+    def test_end_to_end_value_mismatch_surfaces_via_client(self):
+        # 环回链路上把回显值 +1，client.write 必须报错而不是静默成功
+        transport = _LoopbackTransport()
+        original_recv = transport.recv
+
+        def corrupt_value_echo():
+            unit, pdu = original_recv()
+            return unit, struct.pack(">BHH", pdu[0], int.from_bytes(pdu[1:3], "big"),
+                                     int.from_bytes(pdu[3:5], "big") + 1)
+
+        client = ModbusClient(transport, unit=1, retries=0)
+        client.transport.recv = corrupt_value_echo  # type: ignore[method-assign]
         with self.assertRaises(ModbusError):
             client.write(6, 7, [123])
 

@@ -56,10 +56,16 @@ def _hex_to_bytes(text: str) -> bytes:
     for part in parts:
         if len(part) % 2:                    # 连写的 hex 可能整体没有空格
             raise ValueError(f"「{part}」不是成对的十六进制字节")
-        try:
-            out.append(int(part, 16) & 0xFF)
-        except ValueError as exc:
-            raise ValueError(f"「{part}」不是合法的十六进制字节") from exc
+        # 4 位一组的书写（Wireshark data 列、设备手册常见「0106 0005 BEEF」）
+        # 必须按两字符一组切开。早期实现 int(part,16) 后 &0xFF，会把
+        # "01 03 1234" 解析成 01 03 34 —— 高位字节静默丢失，对一个
+        # 「把报文拆给人看」的工具，给错结果还不报警是最糟的失败模式。
+        for i in range(0, len(part), 2):
+            chunk = part[i:i + 2]
+            try:
+                out.append(int(chunk, 16))
+            except ValueError as exc:
+                raise ValueError(f"「{chunk}」不是合法的十六进制字节") from exc
     if len(out) < 2:
         raise ValueError("报文太短，连功能码都放不下")
     return bytes(out)

@@ -114,6 +114,20 @@ class TestScaling(unittest.TestCase):
     def test_negative_scale(self):
         self.assertEqual(decode([100], DataType.INT16, scale=-1)[0], -100)
 
+    def test_zero_scale_rejected_on_decode(self):
+        # 2026-10-24 规范评审 P0-2 回归：scale=0 曾把所有读数静默归零，
+        # 看起来像「设备读不到数据」—— 现在必须显式报错。
+        with self.assertRaises(ValueError) as ctx:
+            decode([1234], DataType.UINT16, scale=0)
+        self.assertIn("系数不能为 0", str(ctx.exception))
+
+    def test_zero_scale_rejected_on_encode(self):
+        # 旧实现走到除法才抛 ZeroDivisionError（界面只捕 ValueError，
+        # 用户看到的是「操作失败（内部错误）」）
+        with self.assertRaises(ValueError) as ctx:
+            encode([220.5], DataType.FLOAT32, scale=0)
+        self.assertIn("系数不能为 0", str(ctx.exception))
+
 
 class TestEdges(unittest.TestCase):
     def test_partial_span_is_dropped(self):
