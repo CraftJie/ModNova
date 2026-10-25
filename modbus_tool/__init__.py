@@ -17,7 +17,7 @@
     gui.py          桌面界面
 """
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 from .client import ModbusClient
 from .core import ModbusCore

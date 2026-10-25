@@ -15,18 +15,21 @@ from __future__ import annotations
 
 import base64
 import collections
-import csv
+import ipaddress
 import math
 import os
 import queue
+import socket
 import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
-from tkinter import filedialog, ttk
+from datetime import datetime
+from tkinter import filedialog, messagebox, ttk
 
 from .addressing import AddressError, area_of_fc, display_address, resolve_address
 from .applog import install_excepthook
 from .client import ModbusClient
+from .config import Config
 from .codec import (
     DTYPE_LABEL,
     NONPRINT,
@@ -46,33 +49,92 @@ from .frameparser import parse_frame
 from .parsing import normalize_number as _normalize_number
 from .parsing import parse_int as _parse_int
 from .parsing import parse_write_values, split_values as _split_values
-from .pdu import DEVICE_ID_OBJECTS, describe_error, describe_write_frame, read_limit, write_limit
+from .pdu import (
+    DEVICE_ID_OBJECTS,
+    ModbusError,
+    ParameterError,
+    describe_error,
+    describe_write_frame,
+    read_limit,
+    write_limit,
+)
 from .server import FaultConfig, RtuOverTcpServer, RtuServer, TcpServer
 from .transport import HAS_SERIAL, RtuOverTcpTransport, RtuTransport, TcpTransport, TransportError, list_serial_ports
 from .ui_render import icon_png, photo, png_rgba, render_rounded
 from .ui_tabs import SegmentedTabs
+
+# 连接浮层里标签列的固定宽度：TCP/RTU 两套字段靠它对齐
+POP_LABEL_W = 56
+from .ui_kit import Checkbutton as RoundCheck, RoundedButton, StatusPill
 from .ui_theme import (
     ACCENT,
+    ACCENT_HOVER,
     ACCENT_PRESS,
     BG,
     BORDER,
+    BORDER_SOFT,
     CARD,
+    CTRL_H,
     DISABLED_ARROW,
     DISABLED_BG,
     DISABLED_FG,
     ERR,
+    ERR_SOFT,
+    FAINT,
     FIELD_BG,
+    FONT_DISPLAY,
+    FONT_SECTION,
+    FONT_SM,
+    FONT_TITLE,
     HEAD_BG,
+    HEAD_EDGE,
+    HEAD_FG,
     HOVER_BG,
+    LOG_CRC,
+    LOG_DIR_RX,
+    LOG_DIR_TX,
+    LOG_FC,
     LOG_FONT,
+    LOG_PAYLOAD,
     MONO,
     MUTED,
     OK,
+    PAD_CARD,
+    PAD_CONTAINER,
     SELECT_BG,
+    SP_L,
+    SP_M,
+    SP_S,
+    SP_XL,
+    SP_XS,
+    UI_FONT,
+    SUNKEN,
     TEXT,
     UI_FONT,
     WARN,
 )
+
+# 工具条上的一排按钮统一这个宽度（原来是 ttk 的 11 字符最小宽，
+# 换成自绘后按字数自适应，4 字按钮会比 2 字按钮窄一截）
+TOOLBAR_BTN = 104
+
+# Modbus 标准端口。它不参与「记住上次参数」：现场调试常临时连到 5020/1502
+# 上的模拟器或网关，那种一次性连接如果被记住，下次开软件看到的「默认端口」
+# 就不是 502 了 —— 像配置坏了，而用户根本没动过它。
+DEFAULT_TCP_PORT = 502
+
+# 日志面板最多保留多少条。
+#
+# 原来只留 400 行：轮询一开，几分钟前那几帧就被滚掉了，回头想对「刚才那次
+# 超时前后发了什么」已经找不到。Tk 的 Text 内部是 btree，插入和裁剪的成本
+# 几乎不随总行数增长 —— 实测窗口 400 行和 10 万行的稳态追加速度都是每秒
+# 215 条（瓶颈在 see("end") 的重绘，跟行数无关），所以放大到 10 万只是多占
+# 几十 MB 内存，不会拖慢界面。
+LOG_MAX_LINES = 100_000
+
+# 满了之后一批删多少：约 1%。每来一条就删一次虽然也不慢，但索引树会被
+# 反复搅动，而且「删 79 行」这种零碎步长会让滚动位置一直在抖。
+LOG_TRIM_STEP = 1_000
 
 # 全角归一化、整数解析、写值切分都在 parsing.py —— 命令行用的是同一份，
 # 不然「界面能填 －5、命令行说无效」这种漂移迟早出现。
@@ -92,9 +154,9 @@ FC_OPTIONS = [
 # 链路模式的显示标签 ↔ 内部键。link_mode / slave_mode 里始终存内部键
 # （tcp / rtutcp / rtu），下拉框只负责显示 —— _build_transport、_toggle_server
 # 和测试都只认键，标签以后想改文案不影响逻辑。
-LINK_LABELS = {"tcp": "TCP", "rtutcp": "RTU/TCP", "rtu": "RTU"}
+LINK_LABELS = {"tcp": "TCP", "rtutcp": "RTU over TCP", "rtu": "RTU"}
 LINK_KEYS = {label: key for key, label in LINK_LABELS.items()}
-SLAVE_MODE_LABELS = {"tcp": "TCP 监听", "rtutcp": "RTU/TCP 透传", "rtu": "RTU 串口"}
+SLAVE_MODE_LABELS = {"tcp": "TCP 监听", "rtutcp": "RTU over TCP 透传", "rtu": "RTU 串口"}
 SLAVE_MODE_KEYS = {label: key for key, label in SLAVE_MODE_LABELS.items()}
 
 AREA_OPTIONS = [
@@ -108,43 +170,25 @@ AREA_OPTIONS = [
 READBACK_FC = {5: 1, 6: 3, 15: 1, 16: 3, 22: 3}
 
 # 明细视图最多渲染的行数。Tk Treeview 是整表重建模型，2000 行线圈
-# 每 500ms 轮询重画一次会把界面拖垮；超出部分截断并提示（网格视图
+# 每 500ms 轮询重画一次会把界面拖垮；超出部分截断并提示（概览视图
 # 每 10 格才一行，不在其列）。读寄存器上限 125，天然够不到这个数。
 MAX_DETAIL_ROWS = 1000
 
+# 显示格式。三个选项统一用中文，不混排「值 / HEX / BIN」——
+# 中英混排在同一个下拉里既不像同一组概念，也不便朗读；
+# 十六进制带 0x 前缀后就无需再靠选项名区分进制。
+FMT_VALUE = "数值"
+FMT_HEX = "十六进制"
+FMT_BIN = "二进制"
+FMT_OPTIONS = (FMT_VALUE, FMT_HEX, FMT_BIN)
 
-class _CsvSession:
-    """界面侧的 CSV 记录会话。
+# 地址记法：同一串字符三种读法，互斥。它决定「地址框里的字是什么意思」，
+# 属于参数的一部分，所以摆在地址框右边，而不是塞进「数据定义」弹层 ——
+# 那个弹层回答的是「这一串 16 位数字是什么含义」，地址记法跟它混在一起，
+# 会让人以为地址也是数据类型的一部分。
+ADDR_NOTATIONS = (("十进制", "dec"), ("十六进制", "hex"), ("PLC 地址", "plc"))
+ADDR_NOTATION_KEYS = {label: key for label, key in ADDR_NOTATIONS}
 
-    core.py 的记录器挂在 ModbusCore.read 流程上，而界面直接持有
-    ModbusClient —— 所以这里做一个薄会话，只在读完成时补一行，
-    格式与 core 侧一致（utf-8-sig，Excel 打开中文不乱码）。
-    """
-
-    def __init__(self, path: str) -> None:
-        self.path = path
-        self.rows = 0
-        self._file = open(path, "w", newline="", encoding="utf-8-sig")
-        self._writer = csv.writer(self._file)
-
-    def write(self, cells: list) -> None:
-        self._writer.writerow(cells)
-        self.rows += 1
-        if self.rows % 10 == 0:
-            self._file.flush()
-
-    def close(self) -> None:
-        try:
-            self._file.flush()
-            self._file.close()
-        except OSError:
-            pass
-
-
-def _default_csv_path() -> str:
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    name = f"modnova-csv-{time.strftime('%Y%m%d-%H%M%S')}.csv"
-    return os.path.join(base, "ModNova", "logs", name)
 
 DTYPE_SHORT = {
     "uint16": "u16", "int16": "i16", "uint32": "u32", "int32": "i32",
@@ -155,6 +199,7 @@ DTYPE_SHORT = {
 # 由 codec.DTYPE_LABEL 派生（ vocabulary 单一来源 ），顺序即 DataType 枚举序：
 # ASCII 殿后 —— 前 8 项的下标不要动，测试和工作流里都有按下标取值的地方。
 DTYPE_OPTIONS = [(DTYPE_LABEL[t], t.value) for t in DataType]
+
 
 class ModbusApp:
     def __init__(self, root: tk.Tk) -> None:
@@ -172,17 +217,22 @@ class ModbusApp:
 
         # 运行日志尽早就位：之后的每一条 _log（含报文）都会镜像进滚动文件，
         # 界面被关掉/崩掉之后，事后追查靠的就是它
-        # 运行日志默认不落盘：界面看完就完，要留证据时用日志面板的「导出…」。
+        # 运行日志默认不落盘：界面看完就完，要留证据时用日志面板的「导出」。
         # self.logger 为 None 时 _log 只进界面，一行文件都不写。
         self.logger = None
 
+        # 用户配置：连接成功后回写链路参数，下次开软件直接回填。
+        # 读盘失败 / 文件损坏已在 Config 内部兜底成默认值，这里不另加 try ——
+        # 配置文件坏了就打不开工具，是最恼人的失败方式。
+        self.config = Config()
+
         self.client: ModbusClient | None = None
         self.server = None
-        # -- 双视图状态：True = Modbus Poll 式网格（默认），False = 逐行明细 --
+        # -- 双视图状态：True = 概览（Modbus Poll 式网格，默认），False = 明细 --
         self._master_grid = True
         self._slave_grid = True
         self._last_read = None            # 最近一次读到的原始数据，切换视图时重画用
-        self._slave_grid_per = 10         # 网格每行格数（随进制变化，双击定位地址用）
+        self._slave_grid_per = 10         # 网格每行格数（随格式变化，双击定位地址用）
         self._slave_grid_pad = 0          # 首行左侧留空几格（行首对齐用）
         self._slave_base = 0              # 网格行首基准（per 的整数倍）
         self._slave_start = 0             # 网格真实起始地址
@@ -190,14 +240,21 @@ class ModbusApp:
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="modbus-io")
         self._polling = False
         self._poll_failures = 0
+        # 切到写功能码会自动停轮询，切回读功能码要能自己接上 —— 否则用户
+        # 只是看了眼线圈，回来发现轮询没了，还得手动点一下。用户主动按
+        # 「停止轮询」/Esc 的不在这个范围内，那个意图要尊重。
+        self._poll_resume_on_read = False
+        # FC2B 探测到的设备名（给顶栏链路胶囊用），断开时清掉
+        self._device_note = ""
         self._busy = False
+        self._request_active = False
+        self._request_seq = 0
         self._editing = False
         self._editor: tk.Entry | None = None
         self._demo_counter = 0
         self._log_lines = 0
         self._log_paused = False
-        self._log_skipped = 0
-        self._csv = None                  # CSV 记录会话（勾选「记录 CSV」时存在）
+        self._log_held: list[tuple[str, str]] = []   # 暂停期间的条目缓存，恢复时补记
         self._slave_sig = None          # 上一次从站表格的内容指纹，用来跳过无变化的刷新
         # -- 链路健康：站号、连续失败次数、状态（on / warn / down）--
         self._link_text = ""            # 例如 "TCP 127.0.0.1:15040"
@@ -207,13 +264,22 @@ class ModbusApp:
         self._conn_note = "未连接"       # 连接失败时的原因，直接显示在顶栏
         # -- 变化高亮：上一帧的显示值，用来判断哪一行变了 --
         self._prev_cells: list[str] | None = None
+        # 明细视图上次因超长截断记日志时的点数：轮询每拍都会重画这张表，
+        # 只在点数变化时提醒一次，否则每秒两条把通信日志刷没
+        self._detail_trunc: int | None = None
         self._fade_job = None
         # -- 迷你趋势条：选中单元格的历史值 --
         self._trend: collections.deque = collections.deque(maxlen=120)
         self._trend_key: int | None = None
         self._grid_per = 10             # 网格当前每行格数（点击定位要用）
         self._grid_pad = 0              # 首行左侧留空几格（十六进制对齐用）
-        self._view_state: dict = {}     # 数据解释的当前值（弹层重建时恢复）
+        self._view_state: dict = {}     # 数据定义的当前值（弹层重建时恢复）
+        # -- 地址记法：工具条上那个下拉的两个出口 --
+        # 渲染、解析、弹层恢复都读这两个布尔，下拉框只是它们的编辑器。
+        # 放在这里而不是弹层构造函数里：工具条比弹层先建，而且地址框的
+        # 输入校验要在每次按键时问一句「现在是不是十六进制记法」。
+        self._addr_hex = tk.BooleanVar(value=False)
+        self.plc_var = tk.BooleanVar(value=False)
         self._written_span = None       # 刚写过的寄存器范围 (起, 止)，用来框选
         self._written_marks: list = []  # 框选框的 4 条边框
         self._written_job = None        # 框选过期定时器
@@ -222,7 +288,7 @@ class ModbusApp:
         self._build_ui()
         self._on_link_mode_change()
         self._on_fc_change()
-        self._log("运行日志仅在界面显示；需要留档时用「导出…」手动保存")
+        self._log("运行日志仅在界面显示；需要留档时用「导出」手动保存")
         self._drain_events()
         self._tick_slave_refresh()
         self._tick_demo()
@@ -242,45 +308,65 @@ class ModbusApp:
 
         style.configure(".", background=BG, foreground=TEXT, font=UI_FONT)
         style.configure("TFrame", background=BG)
-        style.configure("Card.TFrame", background=CARD, borderwidth=1, relief="solid")
+        style.configure("Card.TFrame", background=CARD, borderwidth=1, relief="solid",
+                        bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER)
         style.configure("Inner.TFrame", background=CARD)
+        style.configure("Sunken.TFrame", background=SUNKEN)
+        style.configure("Rule.TFrame", background=BORDER_SOFT)
+
         style.configure("TLabel", background=BG, foreground=TEXT)
         style.configure("Card.TLabel", background=CARD, foreground=TEXT)
+        style.configure("Sunken.TLabel", background=SUNKEN, foreground=TEXT)
         style.configure("Muted.TLabel", background=CARD, foreground=MUTED)
+        style.configure("MutedSunken.TLabel", background=SUNKEN, foreground=MUTED)
+        style.configure("SubSunken.TLabel", background=SUNKEN, foreground=MUTED)
+        style.configure("Faint.TLabel", background=CARD, foreground=FAINT, font=FONT_SM)
         style.configure("CardTitle.TLabel", background=CARD, foreground=TEXT,
-                        font=("Microsoft YaHei UI", 10, "bold"))
-        style.configure("AppTitle.TLabel", background=BG, foreground=TEXT,
-                        font=("Microsoft YaHei UI", 14, "bold"))
+                        font=FONT_TITLE)
+        style.configure("Section.TLabel", background=CARD, foreground=TEXT,
+                        font=FONT_SECTION)
+        style.configure("AppTitle.TLabel", background=BG, foreground=MUTED,
+                        font=FONT_DISPLAY)
         style.configure("Sub.TLabel", background=BG, foreground=MUTED)
-        style.configure("Status.TLabel", background=CARD, foreground=MUTED, font=MONO)
-        style.configure("Big.TLabel", background=CARD, foreground=TEXT,
-                        font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("Big.TLabel", background=CARD, foreground=TEXT, font=FONT_TITLE)
 
-        style.configure("TSeparator", background=BORDER)
+        style.configure("TSeparator", background=BORDER_SOFT)
 
-        # 普通按钮：filled 轻拟态 —— 无边框浅灰底，悬停变深一档
-        style.configure("TButton", padding=(14, 6), borderwidth=0,
-                        background=FIELD_BG, foreground=TEXT)
+        # 按钮三语义：中性 filled、主操作 accent、危险 danger（淡红底红字）。
+        # padding 的纵向值决定控件高度 —— 与 TEntry/TCombobox 取同一个 5，
+        # 这样同一行里的输入框和按钮基线才不差 1~2px。
+        style.configure("TButton", padding=(SP_XL, 5), borderwidth=0,
+                        background=FIELD_BG, foreground=TEXT,
+                        focusthickness=0, focuscolor=FIELD_BG)
         style.map("TButton",
                   background=[("disabled", DISABLED_BG),
-                              ("pressed", "#e7e9ed"),
+                              ("pressed", "#dfe4ec"),
                               ("active", HOVER_BG)],
                   foreground=[("disabled", DISABLED_FG)])
-        # 主按钮：品牌蓝胶囊（Tk 画不出真圆角，靠纯色 + 无边框保持轻盈）
-        style.configure("Accent.TButton", background=ACCENT, foreground="white", borderwidth=0)
+        style.configure("Accent.TButton", background=ACCENT, foreground="#ffffff",
+                        borderwidth=0)
         style.map("Accent.TButton",
-                  background=[("disabled", "#b7c8fe"),
+                  background=[("disabled", "#b9c9f7"),
                               ("pressed", ACCENT_PRESS),
-                              ("active", ACCENT_PRESS)],
-                  foreground=[("disabled", "#f0f4ff")])
-        style.configure("Danger.TButton", background="#fef2f2", foreground=ERR, borderwidth=0)
+                              ("active", ACCENT_HOVER)],
+                  foreground=[("disabled", "#f4f7ff")])
+        # 危险操作：淡红底 + 红字，与中性按钮同尺寸 —— 不再整条铺红
+        style.configure("Danger.TButton", background=ERR_SOFT, foreground=ERR,
+                        borderwidth=0)
         style.map("Danger.TButton",
-                  background=[("disabled", DISABLED_BG), ("active", "#fee2e2")],
+                  background=[("disabled", DISABLED_BG),
+                              ("pressed", "#fbdada"),
+                              ("active", "#fce4e4")],
                   foreground=[("disabled", DISABLED_FG)])
-
+        # 幽灵按钮：只给文字，用在卡片标题行的次级动作
+        style.configure("Ghost.TButton", background=CARD, foreground=MUTED,
+                        borderwidth=0, padding=(SP_M, 3))
+        style.map("Ghost.TButton",
+                  background=[("active", HOVER_BG), ("pressed", "#e2e7ee")],
+                  foreground=[("active", TEXT), ("disabled", DISABLED_FG)])
         # 输入框：filled 风格 —— 浅底无边框，聚焦时白底 + 品牌蓝细边
         style.configure("TEntry", fieldbackground=FIELD_BG, bordercolor=BORDER,
-                        lightcolor=BORDER, darkcolor=BORDER, padding=4)
+                        lightcolor=BORDER, darkcolor=BORDER, padding=(SP_S, 5))
         style.map("TEntry",
                   fieldbackground=[("disabled", DISABLED_BG), ("focus", "#ffffff"),
                                    ("!focus", FIELD_BG)],
@@ -290,7 +376,7 @@ class ModbusApp:
                   foreground=[("disabled", DISABLED_FG)])
         style.configure("TCombobox", fieldbackground=FIELD_BG, background=FIELD_BG,
                         arrowcolor=MUTED, bordercolor=BORDER, lightcolor=BORDER,
-                        darkcolor=BORDER, padding=4)
+                        darkcolor=BORDER, padding=(SP_S, 5))
         # 禁用态必须一眼看出来。clam 默认的禁用底色被上面的 fieldbackground 覆盖了，
         # 结果灰掉的下拉框还是白底，看着像能点 —— 用户会反复去点它。
         style.map("TCombobox",
@@ -302,7 +388,7 @@ class ModbusApp:
                   lightcolor=[("focus", ACCENT)],
                   darkcolor=[("focus", ACCENT)])
         style.configure("TSpinbox", fieldbackground=FIELD_BG, bordercolor=BORDER,
-                        lightcolor=BORDER, darkcolor=BORDER, arrowcolor=MUTED, padding=4)
+                        lightcolor=BORDER, darkcolor=BORDER, arrowcolor=MUTED, padding=(SP_S, 5))
         style.map("TSpinbox",
                   fieldbackground=[("disabled", DISABLED_BG), ("focus", "#ffffff"),
                                    ("!focus", FIELD_BG)],
@@ -324,38 +410,45 @@ class ModbusApp:
 
         style.configure("Treeview",
                         background=CARD, fieldbackground=CARD, foreground=TEXT,
-                        rowheight=26, borderwidth=0, font=("Consolas", 10))
+                        rowheight=27, borderwidth=0, font=MONO,
+                        bordercolor=BORDER_SOFT, lightcolor=CARD, darkcolor=CARD)
+        # 表头：底色只比卡片深一档（1.05:1），靠 HEAD_EDGE 的 1px 底边和数据区
+        # 切开 —— Tk 没有阴影，单靠填充差永远差一口气
         style.configure("Treeview.Heading",
-                        background=HEAD_BG, foreground="#81858c",
-                        relief="flat", font=("Microsoft YaHei UI", 9), padding=(2, 3))
+                        background=HEAD_BG, foreground=HEAD_FG,
+                        relief="flat", font=UI_FONT, padding=(SP_S, 5),
+                        bordercolor=HEAD_EDGE, lightcolor=HEAD_BG, darkcolor=HEAD_EDGE)
         style.map("Treeview", background=[("selected", SELECT_BG)],
                   foreground=[("selected", TEXT)])
         style.map("Treeview.Heading", background=[("active", HEAD_BG)])
 
-        # 网格视图：行更紧凑，一眼能扫更多寄存器（Modbus Poll 的观感）
+        # 概览视图：行更紧凑，一眼能扫更多寄存器（Modbus Poll 的观感）
         style.configure("Grid.Treeview",
                         background=CARD, fieldbackground=CARD, foreground=TEXT,
-                        rowheight=26, borderwidth=0, font=("Consolas", 10))
+                        rowheight=26, borderwidth=0, font=MONO,
+                        bordercolor=BORDER_SOFT, lightcolor=CARD, darkcolor=CARD)
         style.configure("Grid.Treeview.Heading",
-                        background=HEAD_BG, foreground="#81858c",
-                        relief="flat", font=("Microsoft YaHei UI", 9), padding=(2, 3))
+                        background=HEAD_BG, foreground=HEAD_FG,
+                        relief="flat", font=UI_FONT, padding=(SP_S, 4),
+                        bordercolor=HEAD_EDGE, lightcolor=HEAD_BG, darkcolor=HEAD_EDGE)
         style.map("Grid.Treeview", background=[("selected", SELECT_BG)],
                   foreground=[("selected", TEXT)])
         style.map("Grid.Treeview.Heading", background=[("active", HEAD_BG)])
 
         # 滚动条：细、灰、无立体感，贴着内容层走
-        style.configure("TScrollbar", background=CARD, troughcolor=CARD,
-                        bordercolor=CARD, arrowcolor=MUTED, relief="flat")
+        style.configure("TScrollbar", background=CARD, troughcolor=SUNKEN,
+                        bordercolor=CARD, arrowcolor=FAINT, relief="flat",
+                        width=10)
         style.map("TScrollbar",
-                  background=[("active", "#d9dce0"), ("!active", "#e7e9ed")],
-                  arrowcolor=[("active", TEXT), ("!active", MUTED)])
+                  background=[("active", "#cdd4de"), ("!active", "#e2e7ee")],
+                  arrowcolor=[("active", TEXT), ("!active", FAINT)])
 
     # ---------------------------------------------------------------- 布局
 
     def _build_ui(self) -> None:
         self._build_header()
-        self._build_connect_bar()
-        self._build_view_dialog()      # 数据解释：低频，做成弹层
+        self._build_conn_popover()
+        self._build_view_dialog()      # 数据定义：低频，做成弹层
 
         self.stack = tk.Frame(self.root, bg=BG)
         self.stack.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -378,27 +471,55 @@ class ModbusApp:
         self.root.bind_all("<Control-Key-1>", lambda e: self.tabs.select(0))
         self.root.bind_all("<Control-Key-2>", lambda e: self.tabs.select(1))
         self.root.bind_all("<F6>", lambda e: self.tabs.select(1 - self.tabs.index))
-        # 现场是左手键盘右手鼠标：读取这种高频动作不该只能点按钮
+        # 现场是左手键盘右手鼠标：切页、停轮询、手动补读都该有键可用，
+        # 不必每次把手从键盘挪到鼠标上点按钮
         self.root.bind_all("<F5>", lambda e: self._run_primary())
         self.root.bind_all("<Control-Return>", lambda e: self._run_primary())
-        self.root.bind_all("<Escape>", lambda e: self._stop_poll())
+        self.root.bind_all("<Escape>", lambda e: self._stop_poll(manual=True))
+        # Ctrl+I：问一句「对面是谁」。和右键菜单是同一个入口 —— 工具条上不再
+        # 常驻一个「识别」按钮，把位置让给读/写/轮询这些真正高频的动作
+        self.root.bind_all("<Control-Key-i>", self._on_identify_key)
         self.root.bind_all("<Control-Key-l>", lambda e: self._clear_log())
+        self._sync_master_chrome()
 
     def _run_primary(self) -> str:
-        """F5 / Ctrl+Enter：按当前功能码跑一次（读或写）。"""
+        """F5 / Ctrl+Enter：跟随当前页 —— 主站页执行一次，从站页刷新表格。
+
+        主站页已经没有「读取」按钮（数据由轮询持续刷新），F5 在读功能码下
+        等价于「手动补读一次」，写功能码下就是执行写入。
+        全局快捷键不看页签就发主站请求，是切换体验上的一种「残留」：
+        在从站页按 F5（肌肉记忆里是「刷新」），未连接时「尚未连接」会写进
+        从站页看不见的主站状态栏，已连接时更是后台真发一帧读。从站页的
+        F5 语义就应该是刷新从站表格；没起从站或没变化时它自然空转。
+        """
+        if self.tabs.index == 1:
+            self._refresh_slave_table()
+            return "break"
         if self._current_fc() in (1, 2, 3, 4):
-            self._do_read_async()
+            self._read_once()
         else:
             self._do_write_async()
         return "break"
 
+    def _on_identify_key(self, _event=None):
+        """Ctrl+I：读设备标识。吃了这个事件，免得 Entry 里插进一个制表符。"""
+        self._identify_device_async()
+        return "break"
+
     def _switch_tab(self, index: int) -> None:
+        # 先把打开中的就地编辑器按「失焦」收尾：页签点击刻意不抢键盘焦点
+        # （SegmentedTabs 的设计），FocusOut 不会自己来 —— 不处理的话编辑器
+        # 会被 grid_remove 藏起来活到最后，切回来悬在可能已经错位的坐标上。
+        # 合成 FocusOut 复用编辑器自己的语义：从站失焦提交、主站失焦取消。
+        if self._editor is not None:
+            try:
+                self._editor.event_generate("<FocusOut>")
+            except tk.TclError:
+                self._cancel_edit()
         if index == 1:
             self.tab_master.grid_remove()
             self.tab_slave.grid()
             self.tab_slave.tkraise()
-            if getattr(self, "_log_open", False):
-                self.log_panel.lift()
             # 切过来立刻刷一次。刷新已经是原地更新（数据没变就一行都不动），
             # 不会再出现「先白一下再填满」的闪动，也就没理由让用户看旧值。
             self._refresh_slave_table()
@@ -406,6 +527,19 @@ class ModbusApp:
             self.tab_slave.grid_remove()
             self.tab_master.grid()
             self.tab_master.tkraise()
+        # 日志覆盖层只跟主站页走：在主站开的日志不该盖到从站表格上。
+        # 这里两头都要重摆，光处理一头都不对 ——
+        #   只在进从站页 lift：日志会一直盖在从站页上（2026-10-24 用户报的 bug）；
+        #   只在回主站页 lift：tkraise 已把主站页顶到日志上面，日志开着却看不见。
+        # _log_open 只记「用户开没开」，可见性由当前页决定；切页不动日志内容，
+        # 从站页期间的「主站接入 / 故障注入」照样记着，切回主站就能看到。
+        if index == 0 and self._log_open:
+            self._show_log_panel()
+        else:
+            self.log_panel.pack_forget()
+        # 主站专属顶栏控件（连接按钮/状态灯）同理：不跟到从站页，
+        # 切回时按连接状态决定去留；连接浮层也要顺手收起
+        self._sync_master_chrome()
 
     def _brand_mark(self, parent) -> tk.Canvas:
         """品牌方块：品牌蓝圆角底 + 白色 M。
@@ -432,12 +566,12 @@ class ModbusApp:
         页签从独立一行挪进来，是为了把高度还给数据区 —— 那一行 34px
         在 780 高的窗口里就是 4.4% 的数据面积。
         """
-        header = ttk.Frame(self.root, padding=(12, 6, 12, 6))
+        header = ttk.Frame(self.root, padding=(PAD_CONTAINER, SP_M, PAD_CONTAINER, SP_M))
         header.pack(fill="x")
 
         brand = ttk.Frame(header)
         brand.pack(side="left")
-        self._brand_mark(brand).pack(side="left", padx=(0, 8))
+        self._brand_mark(brand).pack(side="left", padx=(0, SP_M))
         ttk.Label(brand, text="ModNova", style="AppTitle.TLabel").pack(side="left")
 
         self.tabs = SegmentedTabs(
@@ -445,32 +579,195 @@ class ModbusApp:
             labels=["主站 · 读别人", "从站 · 被别人读"],
             on_change=self._switch_tab,
             badge_slots=(1,),
-            height=26,
+            height=CTRL_H,
         )
-        self.tabs.pack(side="left", padx=(18, 0))
+        self.tabs.pack(side="left", padx=(SP_XL, 0))
 
-        self.connect_btn = ttk.Button(header, text="连接", style="Accent.TButton",
-                                      width=7, command=self._toggle_connection)
-        self.connect_btn.pack(side="right")
-        self.led = ttk.Label(header, text="●  未连接", style="Sub.TLabel")
-        self.led.pack(side="right", padx=(0, 14))
+        # 分裂按钮：主区是「连/断」这个动作本身（未连接=按当前参数直接连，
+        # 已连接=断开），右侧窄条 ▾ 只负责展开参数表单。这样最常用的动作
+        # 一次点击完成，「换 IP / 换串口」这种低频操作才需要第二步。
+        self.connect_btn = RoundedButton(header, text="连接", style="Accent.TButton",
+                                         min_width=96,
+                                         command=self._on_connect_click,
+                                         split_command=self._on_connect_menu)
+        self.led = StatusPill(header, text="未连接", tone="idle", max_width=360)
+        self.led.pack(side="right", padx=(0, SP_L))
+
+    def _on_connect_click(self) -> None:
+        """主区：未连接 = 直接按当前参数连，已连接 = 断开。
+
+        参数表单不拦在中间了 —— 默认值（127.0.0.1:502 / 站 1）就是现场
+        最常见的组合，而「先弹表单再点连接」等于把每一次连接都变成两步。
+        要改参数走右边的 ▾。
+        """
+        self._close_conn_popover()
+        self._toggle_connection()
+
+    def _on_connect_menu(self) -> None:
+        """窄条 ▾：只展开/收起参数表单，不碰连接状态。"""
+        self._toggle_conn_popover()
+
+    def _on_conn_go(self) -> None:
+        """浮层底部那颗「连接/断开」：动作在表单里完成，做完就收起表单。
+
+        连接失败时浮层必须留着 —— 失败的原因通常就在刚填的那几项里，
+        收起来等于把「为什么没连上」一起收走了（失败原因进状态栏和日志）。
+        """
+        if self.client is not None:
+            self._close_conn_popover()
+        self._toggle_connection()
+
+    # -- 连接参数的记忆 ----------------------------------------------------
+    #
+    # 现场一台设备配一次参数，之后每天开软件都是同一组 IP / 端口。让人每次
+    # 重填就是在赌他记得住 —— 而记错一位数字的表现是「连不上」，看起来像
+    # 设备故障。所以：**连成功**就把这组参数落盘，下次启动直接回填。
+    #
+    # 只记「成功过」的那一组：每改一次就存的话，一次手滑改错也会变成下次的
+    # 默认值，等于把失败固化成起点。
+
+    @staticmethod
+    def _num_of(text, fallback, cast=int):
+        """控件文本 → 数字，读不出来时退回默认值（配置文件可以被手改）。"""
+        try:
+            return cast(str(text).strip())
+        except (TypeError, ValueError):
+            return fallback
+
+    @staticmethod
+    def _fill_field(widget, value: str) -> None:
+        widget.delete(0, "end")
+        widget.insert(0, value)
+
+    def _save_link_settings(self) -> None:
+        """连接成功后把当前这组链路参数写进配置文件。"""
+        link = {
+            "mode": self.link_mode.get(),
+            "host": self.tcp_host.get().strip() or "127.0.0.1",
+            "port": self._num_of(self.tcp_port.get(), DEFAULT_TCP_PORT),
+            "port_name": self.rtu_port.get().strip(),
+            "baud": self._num_of(self.baud.get(), 9600),
+            "databits": self._num_of(self.databits.get(), 8),
+            "parity": self.parity.get() or "N",
+            "stopbits": self._num_of(self.stopbits.get(), 1.0, float),
+            "unit": self._num_of(self.unit_var.get(), 1),
+            "timeout": self._num_of(self.timeout_var.get(), 2.0, float),
+            "retries": self._num_of(self.retry_var.get(), 0),
+        }
+        self.config.update_link(link)
+        try:
+            self.config.save()
+        except OSError as exc:
+            # 存不下只意味着「下次要重填」，不能因此动已经连上的链路
+            self._log(f"连接参数未能保存：{exc}")
+
+    def _restore_link_settings(self) -> None:
+        """按上次成功的参数回填控件。
+
+        Config 已把用户文件叠在默认值上，字段一定齐；仍然逐项校验范围 ——
+        配置文件是纯文本，手改错了不该让界面带着非法值启动。
+        """
+        link = self.config.link
+
+        mode = link.get("mode")
+        if mode in LINK_LABELS:                  # 未知值（手改错）就留在默认 TCP
+            self.link_mode.set(mode)
+            self._on_link_mode_change()
+
+        host = str(link.get("host") or "").strip()
+        if host:
+            self._fill_field(self.tcp_host, host)
+
+        # 端口不参与记忆，永远从 502 起（这里显式写回去，不再读配置）。
+        #
+        # 端口不像 IP / 串口那样是「这台设备的身份」，它基本恒为 502；真正会
+        # 变的是调试时临时连一次别处的服务（本机模拟器起在 5020、别人的网关
+        # 开在 1502）。那种一次性连法一旦被记住，下次开软件看到的「默认端口」
+        # 就不是 502 了 —— 像配置被改坏，而用户根本没改过它。502 是标准值，
+        # 让它当默认比「记住最后一次」更符合直觉；真要连非标端口，当场改一次
+        # 也就一次。
+        self._fill_field(self.tcp_port, str(DEFAULT_TCP_PORT))
+
+        unit = self._num_of(link.get("unit"), 0)
+        if 1 <= unit <= 247:
+            self._fill_field(self.unit_var, str(unit))
+
+        timeout = self._num_of(link.get("timeout"), 0.0, float)
+        if 0.1 <= timeout <= 30:
+            self._fill_field(self.timeout_var, f"{timeout:g}")
+
+        retries = self._num_of(link.get("retries"), -1)
+        if 0 <= retries <= 5:
+            self._fill_field(self.retry_var, str(retries))
+
+        # 串口名可能是「上次插着、这次没插」的那个口：照样回填。
+        # 现场最常见的抱怨是「明明存过 COM5，打开却是空的」—— 设备没插
+        # 是设备的事，界面不该假装从没配过。没在下拉列表里就补进去。
+        name = str(link.get("port_name") or "").strip()
+        if name:
+            values = list(self.rtu_port.cget("values") or ())
+            if name not in values:
+                self.rtu_port.configure(values=[name] + values)
+            self.rtu_port.set(name)
+
+        # 下拉型的参数：只接受列表内的值，否则宁可留在默认档
+        baud = str(self._num_of(link.get("baud"), 0))
+        if baud in list(self.baud.cget("values") or ()):
+            self.baud.set(baud)
+        databits = str(self._num_of(link.get("databits"), 0))
+        if databits in list(self.databits.cget("values") or ()):
+            self.databits.set(databits)
+        parity = str(link.get("parity") or "")
+        if parity in list(self.parity.cget("values") or ()):
+            self.parity.set(parity)
+        stopbits = f"{self._num_of(link.get('stopbits'), 0.0, float):g}"
+        if stopbits in list(self.stopbits.cget("values") or ()):
+            self.stopbits.set(stopbits)
 
     def _bar_field(self, parent, label: str, widget) -> None:
-        ttk.Label(parent, text=label, style="Sub.TLabel").pack(side="left", padx=(0, 4))
-        widget.pack(side="left", padx=(0, 10))
+        ttk.Label(parent, text=label, style="Sub.TLabel").pack(side="left", padx=(0, SP_S))
+        widget.pack(side="left", padx=(0, SP_L))
 
     def _install_input_guard(self, widget, maximum: int | float,
-                             decimal: bool = False) -> None:
-        """让 Spinbox 的手敲输入和方向键一样守规矩。
+                             decimal: bool = False, notation: bool = False) -> None:
+        """给输入框挂按键级校验：非法字符拒、超上限拒。
 
-        from_/to 只约束点击箭头，键盘敲进去的它不管 —— 站地址能敲出 9999
-        就是这么来的。挂按键级校验：非数字拒、超上限拒；清空允许（中间态），
-        下限留给连接/启动时的 _int_field 报人话。粘贴也走同一道闸。
+        Spinbox 的 from_/to 只约束点击箭头，键盘敲进去的它不管 —— 站地址能敲出
+        9999 就是这么来的；Entry 更是没有任何内置限制。所以统一在按键这一层
+        拦一道：清空允许（中间态），下限留给连接/启动时的 _int_field 报人话。
+        粘贴也走同一道闸。
         decimal=True 的小数字段（超时）额外放行一个小数点，"2." 这类中间态合法。
+        notation=True 的地址框还要放行 0x 十六进制、0b 二进制和 PLC 六位记法
+        （十进制最大 465535 = 400001 + 65535 - 1）—— 记法换算与区域的语义
+        校验交给 _address_field，只有它报得清「哪里不对」。
+        十六进制记法下裸写的「1A」也放行：既然下拉已经说明这里是十六进制，
+        再逼人补一个 0x 就是让控件白设。
+        注意 Tk 的 validate 对程序化 insert 同样生效，这里拦的不只是键盘。
         """
+        def digits_ok(digits: str, base: int) -> bool:
+            """按进制判字符。以前这里一律用 str.isdigit()，于是 0x1F / 0x0A
+            全被当成非法输入挡在门外 —— 十六进制里出现 a-f 才是常态。"""
+            allowed = "0123456789abcdef" if base == 16 else "01"
+            return all(ch in allowed for ch in digits.lower())
+
         def check(proposed: str) -> bool:
             if proposed == "":
                 return True
+            if notation:
+                body = _normalize_number(proposed)
+                low = body.lower()
+                bare_hex = self._addr_hex.get() and not low.startswith("0b")
+                if low.startswith("0x") or bare_hex:
+                    digits = body[2:] if low.startswith("0x") else body
+                    if digits == "":
+                        return True          # 「0x」是打字中间态，先放行
+                    return digits_ok(digits, 16) and int(digits, 16) <= maximum
+                if low.startswith("0b"):
+                    digits = body[2:]
+                    if digits == "":
+                        return True
+                    return digits_ok(digits, 2) and int(digits, 2) <= maximum
+                return body.isdigit() and int(body) <= 465535
             if decimal:
                 if proposed.count(".") > 1:
                     return False
@@ -485,80 +782,214 @@ class ModbusApp:
         widget.configure(validate="key",
                          validatecommand=(self.root.register(check), "%P"))
 
-    def _build_connect_bar(self) -> None:
-        """连接参数只在「没连上」的时候占位置。
+    def _build_conn_popover(self) -> None:
+        """连接参数收进顶栏按钮的浮层，不再常驻一整行。
 
-        连上之后它收起来，数据区立刻多出 40px —— 现场的使用节奏本来就是
-        设置一次、然后长时间盯着数据。
+        原来这条参数条占主站页 40px。而现场节奏是「设一次参数、然后盯半天
+        数据」，那 40px 绝大多数时间是空的，还把「连接」这个动作拆到了两个
+        地方（参数条填、顶栏点）。现在：点顶栏连接键右边那一格展开这份表单，
+        填完点表单底部的「连接」就连上并自动收起 —— 参数只在「要改」的时候
+        才占位置，主键仍然是一点即连。
+
+        控件对象沿用原名（tcp_host / tcp_port / unit_var …）：它们是参数的
+        唯一来源，工作流和测试都直接读写这些变量，改名字只会制造两套入口。
         """
-        bar = ttk.Frame(self.root, padding=(12, 5, 12, 6))
-        bar.pack(fill="x")
-        self.connect_bar = bar
+        pop = tk.Toplevel(self.root)
+        pop.withdraw()
+        pop.overrideredirect(True)          # 无标题栏：它是浮层，不是一个窗口
+        pop.configure(bg=BORDER)            # 外圈 1px 描边靠底色露出来
+        # overrideredirect 的窗口不受 owner 关系保护，主窗口一旦被置前
+        # 就会把它盖住；transient 把它钉成 root 的从属窗口，才始终浮在上面
+        pop.transient(self.root)
+        self.conn_popover = pop
+
+        body = tk.Frame(pop, bg=CARD, padx=PAD_CARD, pady=PAD_CARD)
+        body.pack(fill="both", expand=True, padx=1, pady=1)
+        self.conn_body = body
+        # 标签列宽定成常量：TCP 与 RTU 两套字段在各自子网格里排版，
+        # 子网格不继承这里的列宽，两边各设一次才能真正对齐
+        body.columnconfigure(0, minsize=POP_LABEL_W)
+        body.columnconfigure(1, weight=1, minsize=236)
+
+        ttk.Label(body, text="连接设置", style="CardTitle.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, SP_M))
 
         self.link_mode = tk.StringVar(value="tcp")
-        ttk.Label(bar, text="链路", style="Sub.TLabel").pack(side="left", padx=(0, 4))
-        self.link_box = ttk.Combobox(bar, values=list(LINK_LABELS.values()),
-                                     state="readonly", width=9)
+        self.link_box = ttk.Combobox(body, values=list(LINK_LABELS.values()),
+                                     state="readonly")
         self.link_box.set(LINK_LABELS["tcp"])
         self.link_box.bind("<<ComboboxSelected>>", self._on_link_box_selected)
-        self.link_box.pack(side="left", padx=(0, 12))
+        row = self._pop_field(body, 1, "连接方式", self.link_box)
 
-        self.link_holder = ttk.Frame(bar)
-        self.link_holder.pack(side="left")
+        # 连接方式不同，字段个数就不同（TCP 2 个 / RTU 5 个），各占一个子网格
+        self.link_holder = ttk.Frame(body, style="Inner.TFrame")
+        self.link_holder.grid(row=row, column=0, columnspan=2, sticky="ew")
+        self.link_holder.columnconfigure(0, weight=1)
+        row += 1
 
-        self.tcp_frame = ttk.Frame(self.link_holder)
+        self.tcp_frame = ttk.Frame(self.link_holder, style="Inner.TFrame")
+        self.tcp_frame.columnconfigure(0, minsize=POP_LABEL_W)
+        self.tcp_frame.columnconfigure(1, weight=1)
         self.tcp_frame.pack(fill="x")
-        self.tcp_host = ttk.Entry(self.tcp_frame, width=14)
+        self.tcp_host = ttk.Entry(self.tcp_frame)
         self.tcp_host.insert(0, "127.0.0.1")
-        self._bar_field(self.tcp_frame, "主机", self.tcp_host)
-        self.tcp_port = ttk.Spinbox(self.tcp_frame, from_=1, to=65535, width=6)
-        self.tcp_port.set("502")
+        self._pop_field(self.tcp_frame, 0, "IP 地址", self.tcp_host)
+        self.tcp_port = ttk.Spinbox(self.tcp_frame, from_=1, to=65535)
+        self.tcp_port.set(str(DEFAULT_TCP_PORT))
         self._install_input_guard(self.tcp_port, 65535)
-        self._bar_field(self.tcp_frame, "端口", self.tcp_port)
+        self._pop_field(self.tcp_frame, 1, "端口", self.tcp_port)
 
-        self.rtu_frame = ttk.Frame(self.link_holder)
+        self.rtu_frame = ttk.Frame(self.link_holder, style="Inner.TFrame")
+        self.rtu_frame.columnconfigure(0, minsize=POP_LABEL_W)
+        self.rtu_frame.columnconfigure(1, weight=1)
         ports = list_serial_ports()
-        self.rtu_port = ttk.Combobox(self.rtu_frame, values=ports, width=9)
+        self.rtu_port = ttk.Combobox(self.rtu_frame, values=ports)
         self.rtu_port.set(ports[0] if ports else "")
-        self._bar_field(self.rtu_frame, "串口", self.rtu_port)
-        self.baud = ttk.Combobox(self.rtu_frame, values=["4800", "9600", "19200", "38400", "57600", "115200"],
-                                 width=7, state="readonly")
+        self._pop_field(self.rtu_frame, 0, "串口", self.rtu_port)
+        self.baud = ttk.Combobox(self.rtu_frame,
+                                 values=["4800", "9600", "19200", "38400",
+                                         "57600", "115200"],
+                                 state="readonly")
         self.baud.set("9600")
-        self._bar_field(self.rtu_frame, "波特率", self.baud)
+        self._pop_field(self.rtu_frame, 1, "波特率", self.baud)
         # 老仪表里 7 数据位（7E1）并不罕见，固定 8 位会一直 CRC 错
         self.databits = ttk.Combobox(self.rtu_frame, values=["8", "7", "6", "5"],
-                                     width=4, state="readonly")
+                                     state="readonly")
         self.databits.set("8")
-        self._bar_field(self.rtu_frame, "数据位", self.databits)
+        self._pop_field(self.rtu_frame, 2, "数据位", self.databits)
         self.parity = ttk.Combobox(self.rtu_frame, values=["N", "E", "O", "M", "S"],
-                                   width=4, state="readonly")
+                                   state="readonly")
         self.parity.set("N")
-        self._bar_field(self.rtu_frame, "校验", self.parity)
+        self._pop_field(self.rtu_frame, 3, "校验", self.parity)
         self.stopbits = ttk.Combobox(self.rtu_frame, values=["1", "1.5", "2"],
-                                     width=4, state="readonly")
+                                     state="readonly")
         self.stopbits.set("1")
-        self._bar_field(self.rtu_frame, "停止位", self.stopbits)
+        self._pop_field(self.rtu_frame, 4, "停止位", self.stopbits)
 
-        common = ttk.Frame(bar)
-        common.pack(side="left", padx=(8, 0))
-        self.unit_var = ttk.Spinbox(common, from_=1, to=247, width=4)
+        self.unit_var = ttk.Spinbox(body, from_=1, to=247)
         self.unit_var.set("1")
         # Modbus 单元号合法域 1~247（0 广播、248+ 保留）：手敲也不许越过 247
         self._install_input_guard(self.unit_var, 247)
-        self._bar_field(common, "站地址", self.unit_var)
-        self.timeout_var = ttk.Spinbox(common, from_=0.1, to=30, increment=0.5, width=4)
+        row = self._pop_field(body, row, "设备地址", self.unit_var)
+
+        self.timeout_var = ttk.Spinbox(body, from_=0.1, to=30, increment=0.5)
         self.timeout_var.set("2")
         self._install_input_guard(self.timeout_var, 30, decimal=True)
-        self._bar_field(common, "超时", self.timeout_var)
-        self.retry_var = ttk.Spinbox(common, from_=0, to=5, width=3)
+        row = self._pop_field(body, row, "超时", self.timeout_var)
+
+        self.retry_var = ttk.Spinbox(body, from_=0, to=5)
         self.retry_var.set("1")
         self._install_input_guard(self.retry_var, 5)
-        self._bar_field(common, "重试", self.retry_var)
+        row = self._pop_field(body, row, "重试", self.retry_var)
 
-        ttk.Button(bar, text="连接", style="Accent.TButton", width=6,
-                   command=self._toggle_connection).pack(side="left", padx=(4, 0))
-        self.env_label = ttk.Label(bar, text="", style="Sub.TLabel")
-        self.env_label.pack(side="left", padx=(10, 0))
+        # 这里原来有一行「连接状态 / 失败原因」（env_label）。撤掉的理由：
+        # 连没连上按钮自己会变「断开」，失败原因同时进了状态栏和日志 ——
+        # 同一句话在三个地方各说一遍，浮层反而多出一行只读的文字。
+        self.conn_go = RoundedButton(body, text="连接", style="Accent.TButton",
+                                     command=self._on_conn_go)
+        self.conn_go.grid(row=row, column=0, columnspan=2, sticky="ew",
+                          pady=(SP_M, 0))
+
+        # 关浮层是「点外面」这一种手势（外加 Esc）：bind_all 常驻，回调里
+        # 先看浮层在不在，不在就立刻返回 —— 解绑反而更容易漏掉某条路径
+        self.root.bind_all("<Button-1>", self._on_popover_click, add="+")
+        self.root.bind_all("<Escape>", self._on_popover_escape, add="+")
+
+        # 控件都建好之后再回填：上次连成功过的那组参数直接出现在表单里，
+        # 主键一点就连上，用户不需要重新敲一遍 IP
+        self._restore_link_settings()
+
+    def _pop_field(self, parent, row: int, label: str, widget) -> int:
+        """浮层里的一行「标签 + 控件」，返回下一行号。"""
+        ttk.Label(parent, text=label, style="Card.TLabel").grid(
+            row=row, column=0, sticky="w", pady=SP_S)
+        widget.grid(row=row, column=1, sticky="ew", padx=(SP_L, 0), pady=SP_S)
+        return row + 1
+
+    # -- 连接浮层 ----------------------------------------------------------
+
+    def _popover_open(self) -> bool:
+        pop = getattr(self, "conn_popover", None)
+        return bool(pop is not None and pop.winfo_ismapped())
+
+    def _toggle_conn_popover(self) -> None:
+        if self._popover_open():
+            self._close_conn_popover()
+        else:
+            self._open_conn_popover()
+
+    def _open_conn_popover(self) -> None:
+        """贴着按钮下沿右对齐浮出 —— 位置跟按钮走，不跟窗口走。"""
+        if self.tabs.index != 0:
+            return
+        pop = self.conn_popover
+        pop.update_idletasks()
+        w = pop.winfo_reqwidth()
+        x = self.connect_btn.winfo_rootx() + self.connect_btn.winfo_width() - w
+        y = self.connect_btn.winfo_rooty() + self.connect_btn.winfo_height() + 6
+        x = max(8, min(x, self.root.winfo_screenwidth() - w - 8))
+        pop.geometry(f"+{x}+{y}")
+        pop.deiconify()
+        pop.lift()
+        if self.client is None:
+            # 打开就把光标放进该改的那个字段，并全选：改 IP / 换串口是这里
+            # 最高频的动作，全选后直接打字就替换，不用先按 Ctrl+A
+            target = self.tcp_host if self.link_mode.get() != "rtu" else self.rtu_port
+            try:
+                target.focus_set()
+                target.select_range(0, "end")
+            except tk.TclError:
+                pass
+
+    def _close_conn_popover(self) -> None:
+        pop = getattr(self, "conn_popover", None)
+        if pop is not None and pop.winfo_ismapped():
+            pop.withdraw()
+
+    def _on_popover_click(self, event) -> None:
+        # 点在自己身上不关，点在别处全关。bind_all 只该挂一次，否则漏一个就是
+        # 「关不掉」；现在全应用只剩连接参数这一个浮层了。
+        if not self._popover_open():
+            return
+        # 点在自己的控件上（含 Combobox 弹出的原生列表 —— 它的窗口路径
+        # 是浮层的子路径）就不关；其余一律关
+        try:
+            path = str(event.widget)
+        except Exception:
+            path = ""
+        if path.startswith(str(self.conn_popover)) or path.startswith(str(self.connect_btn)):
+            return
+        self._close_conn_popover()
+
+    def _on_popover_escape(self, _event=None) -> None:
+        self._close_conn_popover()
+
+    def _sync_master_chrome(self) -> None:
+        """主站专属的顶栏控件（连接按钮 / LED 状态灯）只在主站页出现。
+
+        连/断与切页两头都从这里过：在从站页断开连接时，这些控件不能
+        弹到从站页上；切回主站页时按连接状态恢复。
+
+        - 连接/断开按钮：主站页常驻（连接中它就是「断开」）——参数浮层
+          也挂在它右边那一格 ▾ 下面，所以它是本页唯一的主站链路入口；
+        - LED 状态灯：也是主站链路信息，跟按钮一起只留在主站页 ——
+          从站页顶部只放从站自己的事，运行状态看页签绿灯徽标和「从站参数」卡
+          （2026-10-24 用户三连问：参数条、连接按钮、连接状态灯）。
+        - 浮层：连上了、或者切到从站页，都必须收起来 —— 一个浮在别的
+          页签上的连接表单比任何布局问题都更让人困惑。
+        """
+        if self.tabs.index != 0 or self.client is not None:
+            self._close_conn_popover()
+        if self.tabs.index == 0:
+            self.led.pack(side="right", padx=(0, SP_L))
+            connected = self.client is not None
+            self.connect_btn.configure(
+                text="断开" if connected else "连接",
+                style="Danger.TButton" if connected else "Accent.TButton")
+            self.connect_btn.pack(side="right", before=self.led)
+        else:
+            self.connect_btn.pack_forget()
+            self.led.pack_forget()
 
     def _render_link(self) -> None:
         """顶栏的链路胶囊。
@@ -568,21 +999,41 @@ class ModbusApp:
         """
         if self.client is None:
             failed = "失败" in self._conn_note
-            self.led.configure(text=f"●  {self._conn_note or '未连接'}",
+            self.led.configure(text=f"{self._conn_note or '未连接'}",
                                foreground=ERR if failed else MUTED)
             return
         where = f"{self._link_text} · 站 {self._link_unit}"
+        # 设备支持 FC2B 时白捡的型号名贴在最末 —— 「我读的是哪台」这件事，
+        # 一个型号名比一个站号更让人放心
+        if self._device_note:
+            where += f" · {self._device_note}"
         if self._link_health == "warn":
-            self.led.configure(text=f"●  无响应 {self._fail_streak} 次 · {where}",
+            self.led.configure(text=f"无响应 {self._fail_streak} 次 · {where}",
                                foreground=WARN)
         elif self._link_health == "down":
-            self.led.configure(text=f"●  链路中断 · {where}", foreground=ERR)
+            self.led.configure(text=f"链路中断 · {where}", foreground=ERR)
         else:
-            self.led.configure(text=f"●  在线 · {where}", foreground=OK)
+            self.led.configure(text=f"在线 · {where}", foreground=OK)
 
-    def _mark_link(self, ok: bool) -> None:
-        """每次请求结束都过一遍：成功清零，失败累加并降级。"""
-        if ok:
+    @staticmethod
+    def _replied(error: BaseException) -> bool:
+        """这次失败是不是「从站答了，只是说不行」？
+
+        `ModbusError` 表示收到了并从线上解出了一帧异常响应 —— 线是通的；
+        `ParameterError` 是本地校验没过（请求根本没发出去），不能算在内，
+        它虽然也继承 `ModbusError`。
+        """
+        return isinstance(error, ModbusError) and not isinstance(error, ParameterError)
+
+    def _mark_link(self, ok: bool, replied: bool = False) -> None:
+        """每次请求结束都过一遍：成功清零，失败累加并降级。
+
+        replied=True 的失败不降级：从站回了异常码，说明链路本身是好的，
+        它只是拒绝了这一次请求。把「地址填错」标成「链路中断」，人会去查
+        网线和串口，而真正该改的是地址或功能码。拒绝的理由状态栏已经写清，
+        顶栏只需要老老实实说「在线」。
+        """
+        if ok or replied:
             self._fail_streak = 0
             self._link_health = "on"
         else:
@@ -591,10 +1042,10 @@ class ModbusApp:
         self._render_link()
 
     def _card(self, parent, title: str, actions=None):
-        outer = ttk.Frame(parent, style="Card.TFrame", padding=(14, 11, 14, 13))
+        outer = ttk.Frame(parent, style="Card.TFrame", padding=(PAD_CARD, SP_L, PAD_CARD, SP_L))
         if title:
             head = ttk.Frame(outer, style="Inner.TFrame")
-            head.pack(fill="x", pady=(0, 9))
+            head.pack(fill="x", pady=(0, SP_M))
             ttk.Label(head, text=title, style="CardTitle.TLabel").pack(side="left")
             if actions:
                 actions(head)             # 标题行右侧的视图切换/格式控件
@@ -604,8 +1055,8 @@ class ModbusApp:
 
     def _form_row(self, parent, row: int, label: str, widget, sticky="ew"):
         ttk.Label(parent, text=label, style="Card.TLabel").grid(
-            row=row, column=0, sticky="w", pady=3)
-        widget.grid(row=row, column=1, sticky=sticky, padx=(10, 0), pady=3)
+            row=row, column=0, sticky="w", pady=SP_S)
+        widget.grid(row=row, column=1, sticky=sticky, padx=(SP_L, 0), pady=SP_S)
         parent.columnconfigure(1, weight=1)
         return widget
 
@@ -615,46 +1066,58 @@ class ModbusApp:
         """主站页 = 一条工具条 + 一张铺满的表格 + 一条状态栏。
 
         以前这里是「左栏链路 290px + 右侧操作卡 193px + 数据卡 274px」，
-        数据表只剩 141px。现在设置项都搬走了（连接参数在连接条、数据解释弹层），
+        数据表只剩 141px。现在设置项都搬走了（连接参数在连接条、数据定义弹层），
         剩下的高度全部给表格。
         """
         card = tk.Frame(self.tab_master, bg=CARD)
         card.pack(fill="both", expand=True)
-        card.rowconfigure(2, weight=1)
+        card.rowconfigure(3, weight=1)
         card.columnconfigure(0, weight=1)
 
-        bar = ttk.Frame(card, padding=(10, 6, 10, 4))
+        bar = ttk.Frame(card, style="Sunken.TFrame",
+                        padding=(PAD_CARD, SP_M, PAD_CARD, SP_S))
         bar.grid(row=0, column=0, sticky="ew")
         self._build_toolbar(bar)
-        ttk.Separator(card).grid(row=1, column=0, sticky="ew")
+
+        # 写入预览独占一行（2026-10-24）：原先挤在工具条里，切到写多寄存器后
+        # 一段地址映射文本能把最右的「数据定义」按钮整个顶出窗口 —— 按钮是
+        # 最后 pack 的，空间不够先牺牲它，用户就找不到改类型的地方了。
+        # 挪到独立行后工具条宽度恒定，「数据定义」任何功能码下都在。
+        # 「这个值会占几个寄存器」在按按钮之前就该看得见：
+        # float32 填一个数就是 2 个寄存器，从输入框里数不出来。
+        self.write_hint_row = ttk.Frame(card, style="Sunken.TFrame",
+                                        padding=(PAD_CARD, 0, PAD_CARD, SP_S))
+        self.write_hint = ttk.Label(self.write_hint_row, text="", style="SubSunken.TLabel")
+        self.write_hint.pack(side="left")
+        ttk.Separator(card).grid(row=2, column=0, sticky="ew")
 
         tree_wrap = ttk.Frame(card, style="Inner.TFrame")
-        tree_wrap.grid(row=2, column=0, sticky="nsew")
+        tree_wrap.grid(row=3, column=0, sticky="nsew")
         tree_wrap.rowconfigure(0, weight=1)
         tree_wrap.columnconfigure(0, weight=1)
 
-        # -- 明细视图：一行一个值，HEX/BIN 常驻 --
+        # -- 明细视图：一行一个值，数值/十六进制/二进制三列常驻 --
         self.detail_wrap = ttk.Frame(tree_wrap, style="Inner.TFrame")
         self.detail_wrap.rowconfigure(0, weight=1)
         self.detail_wrap.columnconfigure(0, weight=1)
         columns = ("seq", "addr", "dec", "hex", "bin")
         self.result_tree = ttk.Treeview(self.detail_wrap, columns=columns, show="headings", height=12)
         for key, text, width, anchor in (
-            ("seq", "#", 44, "center"),
-            ("addr", "地址", 96, "center"),
-            ("dec", "值", 130, "e"),
-            ("hex", "HEX", 110, "e"),
-            ("bin", "BIN", 260, "w"),
+            ("seq", "#", 40, "center"),
+            ("addr", "地址", 104, "center"),
+            ("dec", FMT_VALUE, 160, "e"),
+            ("hex", FMT_HEX, 140, "e"),
+            ("bin", FMT_BIN, 320, "w"),
         ):
-            # 表头对齐必须跟数据列一致（值/HEX 是右对齐），否则表头飘在左边、数据贴在右边
+            # 表头对齐必须跟数据列一致（数值/十六进制是右对齐），否则表头飘在左边、数据贴在右边
             self.result_tree.heading(key, text=text, anchor=anchor)
             self.result_tree.column(key, width=width, anchor=anchor, stretch=(key == "bin"))
         self.result_tree.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(self.detail_wrap, orient="vertical", command=self.result_tree.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
+        scroll.grid(row=0, column=1, sticky="ns", padx=(SP_XS, 0))
         self.result_tree.configure(yscrollcommand=scroll.set)
 
-        # -- 网格视图：行头是起始地址，每行 N 格，进制跟「格式」走 --
+        # -- 概览视图：行头是起始地址，每行 N 格，进制跟「格式」走 --
         self.grid_wrap = ttk.Frame(tree_wrap, style="Inner.TFrame")
         self.grid_wrap.rowconfigure(0, weight=1)
         self.grid_wrap.columnconfigure(0, weight=1)
@@ -664,18 +1127,28 @@ class ModbusApp:
         self.result_grid.grid(row=0, column=0, sticky="nsew")
         gscroll = ttk.Scrollbar(self.grid_wrap, orient="vertical",
                                 command=self.result_grid.yview)
-        gscroll.grid(row=0, column=1, sticky="ns")
+        gscroll.grid(row=0, column=1, sticky="ns", padx=(SP_XS, 0))
         self.result_grid.configure(yscrollcommand=gscroll.set)
         # 不装横向滚动条：列宽会平分窗口，永远铺满，那条常驻的空滚动条只是噪音
 
-        # 两个视图叠在同一格，靠 grid_remove 切换；默认亮网格
+        # 两个视图叠在同一格，靠 grid_remove 切换；默认亮概览
         self.grid_wrap.grid(row=0, column=0, sticky="nsew")
         self.detail_wrap.grid(row=0, column=0, sticky="nsew")
         self.detail_wrap.grid_remove()
-        self.result_tree.tag_configure("odd", background="#f9fafb")
+
+        # 空状态：只读 10 个寄存器时表格里只有一行，其余全白。一片空白既不说
+        # 「在等」也不说「没连上」，用户会反复点按钮确认自己是不是漏了什么。
+        # 用 place 浮在数据区中央 —— 不参与 grid，不影响行数计算。
+        self.empty_hint = ttk.Frame(tree_wrap, style="Inner.TFrame")
+        self.empty_title = ttk.Label(self.empty_hint, text="尚未连接",
+                                     style="CardTitle.TLabel")
+        self.empty_title.pack()
+        self.empty_desc = ttk.Label(self.empty_hint, text="", style="Muted.TLabel")
+        self.empty_desc.pack(pady=(SP_S, 0))
+        self.result_tree.tag_configure("odd", background="#f6f8fb")
         # 变化高亮：比 zebra 后建，优先级更高，压得住斑马纹
-        self.result_tree.tag_configure("chg", background="#e4edfd")
-        self.result_grid.tag_configure("chg", background="#e4edfd")
+        self.result_tree.tag_configure("chg", background="#e8eefc")
+        self.result_grid.tag_configure("chg", background="#e8eefc")
         for tree in (self.result_tree, self.result_grid):
             tree.bind("<Button-1>", self._on_table_click, add="+")
             tree.bind("<Motion>", self._on_table_motion, add="+")
@@ -684,117 +1157,185 @@ class ModbusApp:
             tree.bind("<Double-1>", self._on_table_double)
             self._install_copy_menu(tree)
 
-        ttk.Separator(card).grid(row=3, column=0, sticky="ew")
+        ttk.Separator(card).grid(row=4, column=0, sticky="ew")
         self._build_status_bar(card)
         self._draw_trend()
         self._refresh_stats()          # 启动时就把「当前按什么解释」显示出来
 
     def _build_toolbar(self, bar) -> None:
-        """一行装下所有高频动作。低频的「类型/字节序/系数/单位」进弹层。"""
-        def label(text: str) -> None:
-            ttk.Label(bar, text=text, style="Sub.TLabel").pack(side="left", padx=(0, 4))
+        """一条工具条按三区排列：参数区 │ 轮询区 ……………… 视图区。
 
-        self.fc_box = ttk.Combobox(bar, values=[n for n, _ in FC_OPTIONS],
+        分区依据是「这个词属于哪一步」，而不是「控件长什么样」。以前是
+        参数-动作-参数-动作 交替（地址/数量 → 写入/识别 → 轮询间隔 →
+        开始轮询），读功能码下还留着一个灰掉的「写入」占位，整条看过去
+        就是一堆零件平铺。
+
+        读写两组控件现在互斥：读码用轮询区，写码用「值 + 写入」。这既是
+        语义上的正确，也是布局上的稳压器 —— 以前写码下工具条比读码下宽
+        106 px，1040 宽的窗口里把最右边的「数据定义」压成一条 20 px 的
+        碎块，107 px 宽的文字整个看不见。
+        """
+        def label(parent, text: str) -> None:
+            ttk.Label(parent, text=text, style="SubSunken.TLabel").pack(side="left", padx=(0, 4))
+
+        # -- 参数区：功能码 / 地址 / 数量，写码下尾部长出「值 + 写入」--
+        param = ttk.Frame(bar)
+        param.pack(side="left")
+        self._param_group = param
+
+        self.fc_box = ttk.Combobox(param, values=[n for n, _ in FC_OPTIONS],
                                    state="readonly", width=15)
         self.fc_box.current(2)
         self.fc_box.bind("<<ComboboxSelected>>", lambda e: self._on_fc_change())
-        self.fc_box.pack(side="left", padx=(0, 12))
+        self.fc_box.pack(side="left", padx=(0, SP_L))
 
-        label("地址")
-        self.addr_var = ttk.Spinbox(bar, from_=0, to=65535, width=6)
-        self.addr_var.set("0")
-        self._install_input_guard(self.addr_var, 65535)
-        self.addr_var.pack(side="left", padx=(0, 10))
+        label(param, "地址")
+        # 地址框是 Entry，不是 Spinbox。Spinbox 的箭头和滚轮按十进制整数加一减一，
+        # 而地址有三套记法：十六进制下框里写着「1A」，Tk 把它读成 1，滚一格变 2、
+        # 再滚一格变 1 —— 值没了，地址还悄悄换到了别处。地址是「点位」不是「旋钮」，
+        # 本来也没人靠一格一格爬；而误触滚轮的代价，读码时是读错一片，写码时是写进
+        # 别的寄存器。所以这里干脆不给滚轮留接口。
+        self.addr_var = ttk.Entry(param, width=7)
+        self._set_addr_text("0")
+        # 记法守卫：0x 十六进制 / 0b 二进制 / PLC 六位（400001）都要敲得进去
+        self._install_input_guard(self.addr_var, 65535, notation=True)
+        self.addr_var.pack(side="left", padx=(0, 6))
+        # 改地址要连带两件事：写入预览里的地址映射（改地址不刷新，映射就是在骗人），
+        # 以及「用户自己写了 0x 前缀」时把记法下拉同步过去（见 _on_addr_key）
+        self.addr_var.bind("<KeyRelease>", self._on_addr_key)
+        # Tk 8.6 的 Entry 没有 Ctrl+A（8.7 才补上 <<SelectAll>>），而 Windows 上
+        # 「全选→重打」是改地址的默认手法。没有它，框里残留的 0x0000 会跟新敲的
+        # 0x4000 拼成 0x00000x4000，被守卫一个字符一个字符地拒掉 —— 看起来就是
+        # 「0x4000 写不进去」。
+        for seq in ("<Control-a>", "<Control-A>"):
+            self.addr_var.bind(seq, self._select_all_addr)
+        # Entry 本来就没有滚轮绑定，这里显式吃掉一次：将来谁把它换回 Spinbox，
+        # 这条断言式的绑定会立刻把「滚轮改地址」挡回去，不至于又悄悄回归。
+        self.addr_var.bind("<MouseWheel>", lambda _e: "break")
 
-        label("数量")
-        self.count_var = ttk.Spinbox(bar, from_=1, to=2000, width=5)
+        # 记法下拉紧挨着地址框：两者是同一件事的两半（框里这串字按哪套编号读）。
+        # 它原来藏在「数据定义」弹层里做单选框，而那个弹层管的是「值怎么解释」，
+        # 地址记法混在里面既难找，也容易被当成数据类型的一部分。
+        self.addr_notation = ttk.Combobox(param, values=[t for t, _ in ADDR_NOTATIONS],
+                                          state="readonly", width=8)
+        self.addr_notation.set(ADDR_NOTATIONS[0][0])
+        self.addr_notation.bind("<<ComboboxSelected>>", self._on_addr_notation)
+        self.addr_notation.pack(side="left", padx=(0, 10))
+
+        label(param, "数量")
+        self.count_var = ttk.Spinbox(param, from_=1, to=2000, width=5)
         self.count_var.set("10")
         self._install_input_guard(self.count_var, 2000)
         self.count_var.pack(side="left", padx=(0, 10))
 
-        self.write_label = ttk.Label(bar, text="值", style="Sub.TLabel")
-        self.write_label.pack(side="left", padx=(0, 4))
-        self.write_var = ttk.Entry(bar, width=10)
-        self.write_var.pack(side="left", padx=(0, 4))
-        # 「这个值会占几个寄存器」在按按钮之前就该看得见：
-        # float32 填一个数就是 2 个寄存器，从输入框里数不出来。
-        self.write_hint = ttk.Label(bar, text="", style="Sub.TLabel")
-        self.write_hint.pack(side="left", padx=(0, 10))
+        # 写码专用，读码下不 pack（而是禁用）—— 一个灰掉的强调色按钮是
+        # 整条工具条最显眼的「你不能点我」，可读码时本来就没有写的语义
+        self.write_label = ttk.Label(param, text="值", style="SubSunken.TLabel")
+        self.write_var = ttk.Entry(param, width=9)
         self.write_var.bind("<KeyRelease>", lambda e: self._preview_write())
+        self.write_btn = RoundedButton(param, text="写入", style="Accent.TButton", min_width=TOOLBAR_BTN,
+                                    command=self._do_write_async)
+        # 「这个值会占几个寄存器」的预览提示在独立的一行（write_hint_row，
+        # 见 _build_master_tab）—— 放回这行工具条会把右侧按钮挤没。
 
-        self.read_btn = ttk.Button(bar, text="读取", style="Accent.TButton", width=5,
-                                   command=self._do_read_async)
-        self.read_btn.pack(side="left")
-        self.write_btn = ttk.Button(bar, text="写入", width=5, command=self._do_write_async)
-        self.write_btn.pack(side="left", padx=(6, 0))
-        # FC2B 读设备识别：联调第一步「对面到底是谁」——厂商/型号/版本一次看全
-        self.identify_btn = ttk.Button(bar, text="识别", width=5,
-                                       command=self._identify_device_async)
-        self.identify_btn.pack(side="left", padx=(6, 0))
-
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=12)
-
-        label("轮询")
-        self.interval_var = ttk.Spinbox(bar, from_=50, to=60000, increment=50, width=5)
+        # -- 轮询区：间隔与启停，写码下整区隐藏（轮询只对读码有意义）--
+        poll = ttk.Frame(bar)
+        poll.pack(side="left")
+        self._poll_group = poll
+        ttk.Separator(poll, orient="vertical").pack(side="left", fill="y", padx=(0, SP_L))
+        label(poll, "轮询")
+        self.interval_var = ttk.Spinbox(poll, from_=50, to=60000, increment=50, width=5)
         self.interval_var.set("500")
         self._install_input_guard(self.interval_var, 60000)
         self.interval_var.pack(side="left")
-        ttk.Label(bar, text="ms", style="Sub.TLabel").pack(side="left", padx=(3, 8))
-        self.poll_btn = ttk.Button(bar, text="开始轮询", width=8, command=self._toggle_poll)
+        ttk.Label(poll, text="ms", style="SubSunken.TLabel").pack(side="left", padx=(3, 8))
+        self.poll_btn = RoundedButton(poll, text="开始轮询", min_width=TOOLBAR_BTN,
+                                      command=self._toggle_poll)
         self.poll_btn.pack(side="left")
 
-        # 右侧：视图与显示
-        self.master_view_btn = ttk.Button(bar, text="明细", width=5,
-                                          command=self._toggle_master_view)
-        self.master_view_btn.pack(side="right")
-        self.master_fmt_box = ttk.Combobox(bar, values=("值", "HEX", "BIN"),
-                                           state="readonly", width=4)
-        self.master_fmt_box.set("值")
-        self.master_fmt_box.pack(side="right", padx=(0, 6))
-        ttk.Label(bar, text="格式", style="Sub.TLabel").pack(side="right", padx=(0, 4))
+        # -- 视图区：靠右对齐，由左及右是「数据是什么」→「怎么看」--
+        # 组内一律 side="left"：明细视图下「格式」这一对要临时收起再插回，
+        # 而 side="left" 的 before= 就是朴素意义上的「插到它左边」。
+        # 原来组内是 side="right" + before=view_btn，插回时反而跑到按钮右边，
+        # 切一次视图顺序就从「格式｜下拉｜明细」变成「明细｜下拉｜格式」。
+        view = ttk.Frame(bar)
+        view.pack(side="right")
+        self._view_group = view
+        # 「数据定义」比「显示设置」准确：里面全是「这串 16 位数字是什么含义」，
+        # 没有一项是界面外观。而且工具条上已有「格式」（数值/十六进制/二进制），
+        # 两个词都叫「显示」会分不清谁管什么。
+        RoundedButton(view, text="数据定义", min_width=TOOLBAR_BTN,
+                   command=self._open_view_dialog).pack(side="left", padx=(0, 10))
+        self.fmt_label = ttk.Label(view, text="格式", style="SubSunken.TLabel")
+        self.fmt_label.pack(side="left", padx=(0, 4))
+        self.master_fmt_box = ttk.Combobox(view, values=FMT_OPTIONS,
+                                           state="readonly", width=8)
+        self.master_fmt_box.set(FMT_VALUE)
+        self.master_fmt_box.pack(side="left", padx=(0, 10))
         self.master_fmt_box.bind("<<ComboboxSelected>>",
                                  lambda e: self._on_display_change())
-        # 「数据解释」比「显示设置」准确：里面全是「这串 16 位数字是什么含义」，
-        # 没有一项是界面外观。而且工具条上已有「格式」（值/HEX/BIN），
-        # 两个词都叫「显示」会分不清谁管什么。
-        ttk.Button(bar, text="数据解释",
-                   command=self._open_view_dialog).pack(side="right", padx=(0, 10))
+        # 视图切换：一个按钮，标签就是另一侧视图的名字（在概览时写「明细」）。
+        # 以前是「概览 / 明细」两段常驻、当前段高亮：一个动作被拆成两个热区，
+        # 切换时得先读哪段是亮的、再去点另一段，还白占一个按钮的宽度。
+        # 合成一个按钮后只有一处可点，也不用再维护「高亮哪一段」那套样式。
+        self.master_view_btn = self._build_view_button(view, self._toggle_master_view)
+        self._sync_master_view_switch()
+
+    def _build_view_button(self, parent, on_pick) -> RoundedButton:
+        """主站页与从站页共用的视图切换按钮。
+
+        标签只写另一侧视图的名字：在概览时写「明细」，在明细时写「概览」。
+        工具条上其余控件也都是名词（数据定义 / 格式 / 轮询），加一串动词
+        反而比邻座长一截；「现在在哪个视图」由标签反推 —— 写着「明细」，
+        说明点下去会去明细，也就是说此刻在概览。
+
+        宽度定成 5 个字符单位（约 65px）：ttk 的 TButton 自带 11 字符最小宽
+        （约 107px），两个字撑在那里面像个空胶囊。5 刚好容下两个字再留一点边，
+        和左边「写入」这类两字按钮同宽，工具条看着才是一排按钮。
+
+        两个页签共用同一个构件 —— 同一个概念（一张表怎么摊开看）在两处
+        用两种控件，最容易让人以为它们不是一回事。
+        """
+        btn = RoundedButton(parent, text="明细", min_width=TOOLBAR_BTN, command=on_pick)
+        btn.pack(side="left")
+        return btn
+
+    @staticmethod
+    def _sync_view_button(btn, grid: bool) -> None:
+        """标签写另一侧视图的名字：在概览写「明细」，在明细写「概览」。"""
+        btn.configure(text="明细" if grid else "概览")
 
     def _build_status_bar(self, card) -> None:
-        row = ttk.Frame(card, padding=(10, 4, 10, 6))
-        row.grid(row=4, column=0, sticky="ew")
+        row = ttk.Frame(card, style="Sunken.TFrame",
+                        padding=(PAD_CARD, SP_S, PAD_CARD, SP_S))
+        row.grid(row=5, column=0, sticky="ew")
 
-        self.master_status = ttk.Label(row, text="尚未通信", style="Muted.TLabel")
+        self.master_status = ttk.Label(row, text="尚未通信", style="MutedSunken.TLabel")
         self.master_status.pack(side="left")
-        # 鼠标指到哪个格子，这里就报它的绝对地址和值 —— 网格里"这是哪个寄存器"
+        # 鼠标指到哪个格子，这里就报它的绝对地址和值 —— 概览里"这是哪个寄存器"
         # 全靠这一行回答，不用再做行首地址 + 列偏移的心算。
-        self.cursor_label = ttk.Label(row, text="", style="Muted.TLabel")
-        self.cursor_label.pack(side="left", padx=(16, 0))
+        # 两个可选提示直到有内容才 pack 出去（见 _set_status_extra）：
+        # 空标签也会画出几像素白底，三个并排看着像无意义的装饰条。
+        self.cursor_label = ttk.Label(row, text="", style="MutedSunken.TLabel")
         # ASCII 模式专用：把这一屏的寄存器拼成一整串贴在状态栏上。
-        # 网格里一格两个字符，横着读要人自己拼 —— 而读型号时想看的就是整串。
-        self.ascii_label = ttk.Label(row, text="", style="Muted.TLabel")
-        self.ascii_label.pack(side="left", padx=(16, 0))
+        # 概览里一格两个字符，横着读要人自己拼 —— 而读型号时想看的就是整串。
+        self.ascii_label = ttk.Label(row, text="", style="MutedSunken.TLabel")
 
-        self.log_toggle_btn = ttk.Button(row, text="▴ 日志 0", command=self._toggle_log_panel)
+        self.log_toggle_btn = RoundedButton(row, text="▴ 日志 0", command=self._toggle_log_panel)
         self.log_toggle_btn.pack(side="right")
-        self.trend_canvas = tk.Canvas(row, width=150, height=20, bg=CARD, highlightthickness=0)
+        self.trend_canvas = tk.Canvas(row, width=150, height=20, bg=SUNKEN, highlightthickness=0)
         # -- 迷你趋势条暂时从状态栏下架（2026-10-24）：绘制与点选逻辑全部保留
         #    （_draw_trend / _push_trend / _set_trend_key / _on_table_click 照常运行，
         #    只是画在一张不显示的画布上），恢复显示 = 取消下面这行的注释。
         # self.trend_canvas.pack(side="right", padx=(10, 12))
-        self.stats_label = ttk.Label(row, text="", style="Muted.TLabel")
+        self.stats_label = ttk.Label(row, text="", style="MutedSunken.TLabel")
         self.stats_label.pack(side="right")
-        # 轮询/读取的结果落 CSV：挂状态栏比藏菜单里更容易被想起来用
-        self.csv_var = tk.BooleanVar(value=False)
-        self.csv_check = ttk.Checkbutton(row, text="记录 CSV",
-                                         variable=self.csv_var, command=self._toggle_csv)
-        self.csv_check.pack(side="right", padx=(0, 12))
 
-    # -- 数据解释弹层（类型/字节序/系数/单位/地址记法）---------------------
+    # -- 数据定义弹层（类型/字节序/系数/偏移量/单位）-------------------------
 
     def _build_view_dialog(self) -> None:
         win = tk.Toplevel(self.root)
-        win.title("数据解释")
+        win.title("数据定义")
         win.configure(bg=CARD)
         win.withdraw()
         win.transient(self.root)
@@ -806,7 +1347,7 @@ class ModbusApp:
 
         body = ttk.Frame(win, style="Inner.TFrame", padding=(18, 16, 18, 14))
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="寄存器怎么解释成物理量", style="CardTitle.TLabel").grid(
+        ttk.Label(body, text="寄存器数据的解释方式", style="CardTitle.TLabel").grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         self.dtype_box = ttk.Combobox(body, values=[n for n, _ in DTYPE_OPTIONS],
@@ -822,40 +1363,31 @@ class ModbusApp:
 
         self.scale_var = ttk.Entry(body, width=10)
         self.scale_var.insert(0, "1")
-        self._dialog_row(body, 3, "× 系数", self.scale_var)
+        self._dialog_row(body, 3, "比例系数", self.scale_var)
 
         # core.read/write 一直支持 bias，但弹层以前只有系数没有偏移，
         # 显示值 = 原始值 × scale + bias 的公式在界面上缺了一半
         self.bias_var = ttk.Entry(body, width=10)
         self.bias_var.insert(0, "0")
-        self._dialog_row(body, 4, "+ 偏移", self.bias_var)
+        self._dialog_row(body, 4, "偏移量", self.bias_var)
 
         self.unit_text_var = ttk.Entry(body, width=10)
         self._dialog_row(body, 5, "单位", self.unit_text_var)
 
-        # 地址记法和「值怎么解释」是两件事，用一条分隔线分开，
-        # 否则混在类型/字节序下面，会以为地址也是数据类型的一部分
-        ttk.Separator(body).grid(row=6, column=0, columnspan=2,
-                                 sticky="ew", pady=(12, 6))
-        ttk.Label(body, text="地址怎么记", style="Muted.TLabel").grid(
-            row=7, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        # 把换算关系写成一行公式：系数与偏移量各自是什么、按什么顺序作用，
+        # 看公式比看两个输入框名更直接
+        ttk.Label(body, text="显示值 = 原始值 × 比例系数 + 偏移量",
+                  style="Muted.TLabel").grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        # 三种记法互斥，所以是单选（Modbus Poll 也是 Base 1 / Base 0 二选一）。
-        # 以前这里是两个复选框，而渲染时 PLC 优先（_addr_hex and not plc_var），
-        # 两个都勾上时十六进制会悄悄失效 —— 看着像开关坏了。
-        self._addr_hex = tk.BooleanVar(value=False)
-        self.plc_var = tk.BooleanVar(value=False)
-        self._addr_mode = tk.StringVar(value="dec")
-        for offset, (text, value) in enumerate((
-                ("十进制", "dec"),
-                ("十六进制（0x0000）", "hex"),
-                ("PLC 记法（40001 起）", "plc"))):
-            ttk.Radiobutton(body, text=text, value=value, variable=self._addr_mode,
-                            command=self._addr_mode_changed).grid(
-                row=8 + offset, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        # 地址记法原来在这里（三种记法三个单选），现在搬到工具条上「地址」旁边
+        # 的下拉 —— 它决定的是「地址框里那串字怎么读」，属于参数，不该埋在
+        # 一个讲「数值怎么解释」的弹层里。
 
-        ttk.Button(body, text="关闭", command=self._close_view_dialog).grid(
-            row=11, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        # 「关闭」不是主操作：靠右、按内容定宽。整条铺满的灰条是全应用里
+        # 最重的形状之一，放在这里会跟「填写参数」这件事抢注意力
+        RoundedButton(body, text="关闭", command=self._close_view_dialog).grid(
+            row=8, column=0, columnspan=2, sticky="e", pady=(SP_XL, 0))
 
         # 重建时把上次的设置放回去，别把用户选的 float32 悄悄变回 u16
         state = self._view_state
@@ -870,7 +1402,7 @@ class ModbusApp:
             self.unit_text_var.insert(0, state.get("unit", ""))
             self.plc_var.set(bool(state.get("plc", False)))
             self._addr_hex.set(bool(state.get("addr_hex", False)))
-            self._sync_addr_mode()
+            self._sync_addr_notation()
 
     def _dialog_row(self, parent, row: int, label: str, widget) -> None:
         ttk.Label(parent, text=label, style="Card.TLabel").grid(
@@ -903,23 +1435,23 @@ class ModbusApp:
             state="readonly", width=11)
         self.parser_mode.current(0)
         self.parser_mode.pack(side="left")
-        ttk.Button(input_row, text="解析", style="Accent.TButton",
+        RoundedButton(input_row, text="解析", style="Accent.TButton",
                    command=self._run_parser).pack(side="left", padx=(8, 0))
-        ttk.Button(input_row, text="填入选中日志行",
+        RoundedButton(input_row, text="填入选中日志行",
                    command=self._parser_fill_from_log).pack(side="left", padx=(8, 0))
 
-        self.parser_input = tk.Text(body, height=3, bg="#f9fafb", fg=TEXT,
+        self.parser_input = tk.Text(body, height=3, bg="#f6f8fb", fg=TEXT,
                                     font=LOG_FONT, relief="flat", padx=8, pady=6,
                                     insertbackground=TEXT, wrap="char")
         self.parser_input.grid(row=2, column=0, sticky="ew")
         ttk.Label(body, text="解析结果", style="Muted.TLabel").grid(
             row=3, column=0, sticky="w", pady=(8, 2))
-        self.parser_output = tk.Text(body, height=12, bg="#f9fafb", fg=TEXT,
+        self.parser_output = tk.Text(body, height=12, bg="#f6f8fb", fg=TEXT,
                                      font=LOG_FONT, relief="flat", padx=8, pady=6,
                                      state="disabled", wrap="word")
         self.parser_output.grid(row=4, column=0, sticky="nsew")
-        ttk.Button(body, text="关闭", command=self._close_parser_dialog).grid(
-            row=5, column=0, sticky="ew", pady=(10, 0))
+        RoundedButton(body, text="关闭", command=self._close_parser_dialog).grid(
+            row=5, column=0, sticky="e", pady=(SP_L, 0))
         self._parser_dialog = win
 
     _PARSER_MODES = {"自动": "auto", "Modbus TCP": "tcp",
@@ -994,29 +1526,83 @@ class ModbusApp:
     def _open_view_dialog(self) -> None:
         if not self._view_dialog.winfo_exists():
             self._build_view_dialog()      # 极端情况下窗口被系统销毁过，重建一个
-        self._sync_addr_mode()         # 界面上的单选要和实际生效的记法一致
+        self._sync_addr_notation()     # 下拉要和实际生效的记法一致
         self._present_dialog(self._view_dialog)
 
-    def _addr_mode_changed(self) -> None:
-        """用户点了某一种地址记法 —— 单选按钮唯一的一次写入口。"""
-        mode = self._addr_mode.get()
+    def _set_addr_text(self, text: str) -> None:
+        """写地址框里的文字。
+
+        Entry 没有 Spinbox 的 set()，改文本得分 delete + insert 两步；
+        这类动作集中一处，省得换控件时到处改。
+        """
+        self.addr_var.delete(0, "end")
+        self.addr_var.insert(0, text)
+
+    def _select_all_addr(self, _event=None) -> str:
+        """地址框全选，并吃掉这次按键（不然 Ctrl+A 还会插一个「a」）。"""
+        self.addr_var.selection_range(0, "end")
+        self.addr_var.icursor("end")
+        return "break"
+
+    def _on_addr_key(self, _event=None) -> None:
+        """地址框每次松键后：把 0x 前缀同步到记法下拉，再刷新写入预览。
+
+        用户在框里亲手写下 0x，就是当场声明「这是十六进制地址」。这句声明比
+        下拉更具体，界面必须跟着它走 —— 否则停在下拉写着「PLC 地址」时输入
+        0x4000，会被当成 PLC 编号 16384，报一句「属于离散输入」，而用户看到的
+        只是「0x4000 不能用」。同步只改下拉与内部记法，不动框里的字，所以
+        打字过程中值不会被反复换算。
+        """
+        raw = _normalize_number(self.addr_var.get()).strip().lower()
+        if raw.startswith("0x") and not self._addr_hex.get():
+            self._addr_hex.set(True)
+            self.plc_var.set(False)
+            self._sync_addr_notation()
+            self._on_display_change()
+        self._preview_write()
+
+    def _on_addr_notation(self, _event=None) -> None:
+        """换了地址记法：把框里已有的值翻译过去，再整屏重画。
+
+        翻译是必须的 —— 下拉说的是「这串字怎么读」，同一串「10」在十进制下
+        是十号寄存器、在十六进制下是十六号。留着原文不换算，用户切一下
+        记法，读的地址就悄悄变了；换算成同一处寄存器，切换才是纯显示变化。
+        """
+        fc = self._current_fc()
+        mode = ADDR_NOTATION_KEYS.get(self.addr_notation.get(), "dec")
+        try:
+            protocol = self._address_field(fc)      # 先按旧记法读成协议地址
+        except ValueError:
+            protocol = None                        # 框里本来就是半截输入，别动它
         self._addr_hex.set(mode == "hex")
         self.plc_var.set(mode == "plc")
-        self._on_display_change()
+        if protocol is not None:
+            self._set_addr_text(self._addr_text(protocol, fc))
+        # 刚换完记法，下一步几乎一定是要改地址（0x0000 → 0x4000 这种）。
+        # 顺手全选，让第一下按键就是替换而不是追加。
+        if self.addr_var.get():
+            self.addr_var.selection_range(0, "end")
+            self.addr_var.icursor("end")
+        self._preview_write()                      # 写入预览里的地址映射跟着变
+        self._on_display_change()                  # 表头地址、状态栏回声
 
-    def _sync_addr_mode(self) -> None:
-        """把两个内部布尔反过来对齐到单选按钮上。
+    def _sync_addr_notation(self) -> None:
+        """把两个内部布尔反过来对齐到工具条下拉。
 
-        这两个布尔可能是别处改的（弹层重建恢复、测试直接 set），打开弹层时对齐一次，
-        免得界面显示「十进制」而实际已经在按 PLC 记法解析。
+        这两个布尔是真正的状态（渲染/解析/弹层恢复都读它们），下拉只是它们的
+        编辑器；别处改了布尔（弹层恢复、测试直接 set），这里对齐一次，
+        免得下拉写着「十进制」而实际已经按十六进制在解析。
         """
+        box = getattr(self, "addr_notation", None)
+        if box is None:          # 工具条还没建（弹层先于工具条构建）
+            return
         if self.plc_var.get():
             mode = "plc"
         elif self._addr_hex.get():
             mode = "hex"
         else:
             mode = "dec"
-        self._addr_mode.set(mode)
+        box.set({key: label for label, key in ADDR_NOTATIONS}[mode])
 
     def _close_view_dialog(self) -> None:
         try:
@@ -1035,17 +1621,22 @@ class ModbusApp:
         container.rowconfigure(0, weight=1)
 
         cfg_card, cfg_body = self._card(container, "从站参数")
-        cfg_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        cfg_card.grid(row=0, column=0, sticky="nsew", padx=(0, SP_L))
 
+        # 「模式」这一行必须和下面的 _form_row 用同一套 grid 网格：
+        # 原来是 pack(side="left") 手排，标签宽度和下拉宽度都不受网格约束，
+        # 于是它比下面四个输入框整体左移约 40px 一条线都对齐不了。
         mode_row = ttk.Frame(cfg_body, style="Inner.TFrame")
-        mode_row.pack(fill="x", pady=(0, 6))
+        mode_row.pack(fill="x")
+        mode_row.columnconfigure(1, weight=1)
         self.slave_mode = tk.StringVar(value="tcp")
-        ttk.Label(mode_row, text="模式", style="Sub.TLabel").pack(side="left", padx=(0, 4))
+        ttk.Label(mode_row, text="模式", style="Card.TLabel").grid(
+            row=0, column=0, sticky="w", pady=SP_S)
         self.slave_mode_box = ttk.Combobox(mode_row, values=list(SLAVE_MODE_LABELS.values()),
-                                           state="readonly", width=12)
+                                           state="readonly", width=18)
         self.slave_mode_box.set(SLAVE_MODE_LABELS["tcp"])
         self.slave_mode_box.bind("<<ComboboxSelected>>", self._on_slave_box_selected)
-        self.slave_mode_box.pack(side="left")
+        self.slave_mode_box.grid(row=0, column=1, sticky="ew", padx=(SP_L, 0), pady=SP_S)
 
         self.slave_link_holder = ttk.Frame(cfg_body, style="Inner.TFrame")
         self.slave_link_holder.pack(fill="x")
@@ -1060,9 +1651,11 @@ class ModbusApp:
         self.slave_port.set("502")
         self._install_input_guard(self.slave_port, 65535)
         self._form_row(self.slave_tcp_frame, 1, "端口", self.slave_port)
+        # 提示挂在输入框列（column=1），左边缘与输入框对齐 —— 落在标签列会被
+        # 当成第三个字段名，而它其实是「监听地址」这个字段的补充说明
         ttk.Label(self.slave_tcp_frame, text="局域网访问请改成 0.0.0.0",
-                  style="Muted.TLabel").grid(row=2, column=0, columnspan=2,
-                                             sticky="w", pady=(2, 0))
+                  style="Muted.TLabel").grid(row=2, column=1, sticky="w",
+                                             padx=(SP_L, 0), pady=(SP_XS, 0))
 
         self.slave_rtu_frame = ttk.Frame(self.slave_link_holder, style="Inner.TFrame")
         ports = list_serial_ports()
@@ -1090,65 +1683,72 @@ class ModbusApp:
 
         self.slave_tcp_frame.pack(fill="x")
 
-        ttk.Separator(cfg_body).pack(fill="x", pady=10)
+        ttk.Separator(cfg_body).pack(fill="x", pady=SP_L)
 
         common = ttk.Frame(cfg_body, style="Inner.TFrame")
         common.pack(fill="x")
-        self.slave_unit = ttk.Spinbox(common, from_=0, to=247, width=8)
+        self.slave_unit = ttk.Spinbox(common, from_=1, to=247, width=8)
         self.slave_unit.set("1")
         self._install_input_guard(self.slave_unit, 247)
         self._form_row(common, 0, "站地址", self.slave_unit)
         self.slave_size = ttk.Spinbox(common, from_=1, to=65536, width=8)
         self.slave_size.set("10000")
         self._install_input_guard(self.slave_size, 65536)
-        self._form_row(common, 1, "区间长度", self.slave_size)
+        self._form_row(common, 1, "数据区长度", self.slave_size)
 
-        self.slave_btn = ttk.Button(cfg_body, text="启动从站", style="Accent.TButton",
-                                    command=self._toggle_server)
-        self.slave_btn.pack(fill="x", pady=(14, 0))
+        # 不再整宽铺一条淡红色带：危险操作和主操作同尺寸、同位置，
+        # 只靠「红字 + 淡红底」区分语义 —— 全宽色块会把页面上最重的视觉
+        # 压在「停止」上，而现场 99% 的时间是在「启动」之后看数据
+        self.slave_btn = RoundedButton(cfg_body, text="启动从站", style="Accent.TButton",
+                                       command=self._toggle_server)
+        self.slave_btn.pack(fill="x", pady=(SP_XL, 0))
 
         self.demo_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(cfg_body, text="输入寄存器模拟变化（便于演示）",
-                        variable=self.demo_var).pack(anchor="w", pady=(10, 0))
+        RoundCheck(cfg_body, text="模拟数据变化（输入寄存器/线圈/离散输入）",
+                        variable=self.demo_var, bg=CARD).pack(anchor="w", pady=(SP_L, 0))
 
         self.slave_stat = ttk.Label(cfg_body, text="未启动", style="Muted.TLabel",
                                     justify="left", wraplength=250)
-        self.slave_stat.pack(anchor="w", pady=(10, 0))
+        self.slave_stat.pack(anchor="w", pady=(SP_L, 0))
 
         # -- 故障注入：把「从站突然不回/回了半帧/CRC 坏了」按需造出来，
         #    验证自己写的上位机会不会崩、会不会把异常当 0。真实设备出问题
         #    时往往不给你复现机会，这里是唯一能"造故障"的地方。
-        ttk.Separator(cfg_body).pack(fill="x", pady=(12, 8))
+        ttk.Separator(cfg_body).pack(fill="x", pady=(SP_L, SP_M))
         ttk.Label(cfg_body, text="故障注入（验证上位机容错）",
                   style="CardTitle.TLabel").pack(anchor="w", pady=(0, 6))
         fault = ttk.Frame(cfg_body, style="Inner.TFrame")
         fault.pack(fill="x")
         fault.columnconfigure(1, weight=1)
         fault.columnconfigure(3, weight=1)
+        self._fault_labels = {}           # 字段名 → 标题标签；CRC 字段禁用时要连标题一起变灰
 
         def fault_field(row: int, col: int, label: str, initial: str,
                         maximum: int, width: int = 6):
-            ttk.Label(fault, text=label, style="Card.TLabel").grid(
-                row=row, column=col, sticky="w", pady=2)
+            lbl = ttk.Label(fault, text=label, style="Card.TLabel")
+            lbl.grid(row=row, column=col, sticky="w", pady=2)
             box = ttk.Spinbox(fault, from_=0, to=maximum, width=width)
             box.set(initial)
             self._install_input_guard(box, maximum)
             box.grid(row=row, column=col + 1, sticky="w", padx=(4, 10), pady=2)
+            self._fault_labels[label] = lbl
             return box
 
-        self.fault_drop = fault_field(0, 0, "丢包 %", "0", 100)
+        self.fault_drop = fault_field(0, 0, "不响应 %", "0", 100)
         self.fault_delay = fault_field(0, 2, "延迟 ms", "0", 60000)
         self.fault_exc = fault_field(1, 0, "异常 %", "0", 100)
         self.fault_exc_code = fault_field(1, 2, "异常码", "4", 255)
         self.fault_trunc = fault_field(2, 0, "截断 %", "0", 100)
         self.fault_crc = fault_field(2, 2, "坏CRC %", "0", 100)
-        ttk.Label(fault, text="坏 CRC 仅 RTU / RTU over TCP 生效",
-                  style="Muted.TLabel").grid(row=3, column=0, columnspan=4, sticky="w")
+        # 「坏 CRC 仅 RTU / RTU over TCP 生效」不再用文字说明 —— 帧里有没有
+        # CRC 由 _sync_crc_field 直接表态：TCP 模式字段禁用、标题变灰；
+        # RTU 系模式恢复正常。状态比常驻说明更准（跟实际模式走）。
+        self._sync_crc_field()
 
         fault_actions = ttk.Frame(cfg_body, style="Inner.TFrame")
         fault_actions.pack(fill="x", pady=(8, 0))
-        ttk.Button(fault_actions, text="应用", command=self._apply_faults).pack(side="left")
-        ttk.Button(fault_actions, text="全部清零",
+        RoundedButton(fault_actions, text="应用", command=self._apply_faults).pack(side="left")
+        RoundedButton(fault_actions, text="清除故障",
                    command=self._clear_faults).pack(side="left", padx=(6, 0))
         self.fault_stat = ttk.Label(cfg_body, text="未注入", style="Muted.TLabel",
                                     justify="left", wraplength=250)
@@ -1156,7 +1756,7 @@ class ModbusApp:
 
         # -- 右：寄存器视图 --
         view_card, view_body = self._card(
-            container, "寄存器视图 · 双击数值可直接改",
+            container, "寄存器视图",
             actions=self._build_slave_view_actions)
         view_card.grid(row=0, column=1, sticky="nsew")
         view_body.rowconfigure(1, weight=1)
@@ -1178,8 +1778,8 @@ class ModbusApp:
         self.view_count.set("32")
         self._install_input_guard(self.view_count, 500)
         self.view_count.pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="刷新", command=self._refresh_slave_table).pack(side="left", padx=(10, 0))
-        ttk.Button(toolbar, text="全部清零", command=self._clear_slave).pack(side="left", padx=(6, 0))
+        RoundedButton(toolbar, text="刷新", command=self._refresh_slave_table).pack(side="left", padx=(10, 0))
+        RoundedButton(toolbar, text="全部清零", command=self._clear_slave).pack(side="left", padx=(6, 0))
         self.slave_edit_hint = ttk.Label(toolbar, text="", style="Muted.TLabel")
         self.slave_edit_hint.pack(side="right")
 
@@ -1197,21 +1797,23 @@ class ModbusApp:
             show="headings", height=16)
         for key, text, width, anchor in (
             ("addr", "地址", 80, "center"),
-            ("dec", "值", 120, "e"),
-            ("hex", "HEX", 90, "e"),
-            ("bin", "BIN", 220, "w"),
+            ("dec", FMT_VALUE, 120, "e"),
+            ("hex", FMT_HEX, 98, "e"),
+            ("bin", FMT_BIN, 220, "w"),
         ):
             self.slave_tree.heading(key, text=text, anchor=anchor)
             self.slave_tree.column(key, width=width, anchor=anchor, stretch=(key == "bin"))
         self.slave_tree.grid(row=0, column=0, sticky="nsew")
         sbar = ttk.Scrollbar(self.slave_detail_wrap, orient="vertical",
                              command=self.slave_tree.yview)
-        sbar.grid(row=0, column=1, sticky="ns")
+        sbar.grid(row=0, column=1, sticky="ns", padx=(SP_XS, 0))
         self.slave_tree.configure(yscrollcommand=sbar.set)
-        self.slave_tree.tag_configure("odd", background="#f9fafb")
+        self.slave_tree.tag_configure("odd", background="#f6f8fb")
         self.slave_tree.bind("<Double-1>", self._begin_cell_edit)
+        self.slave_tree.bind("<Motion>", self._slave_hover)
+        self.slave_tree.bind("<Leave>", self._slave_hover_leave)
 
-        # -- 网格：行头补零起始地址，每行 N 格，进制跟「进制」下拉走 --
+        # -- 概览：行头补零起始地址，每行 N 格，格式跟「格式」下拉走 --
         self.slave_grid_wrap = ttk.Frame(tree_wrap, style="Inner.TFrame")
         self.slave_grid_wrap.rowconfigure(0, weight=1)
         self.slave_grid_wrap.columnconfigure(0, weight=1)
@@ -1221,13 +1823,15 @@ class ModbusApp:
         self.slave_grid.grid(row=0, column=0, sticky="nsew")
         gsbar = ttk.Scrollbar(self.slave_grid_wrap, orient="vertical",
                               command=self.slave_grid.yview)
-        gsbar.grid(row=0, column=1, sticky="ns")
+        gsbar.grid(row=0, column=1, sticky="ns", padx=(SP_XS, 0))
         self.slave_grid.configure(yscrollcommand=gsbar.set)
         # 列宽会平分，横向滚动条没有用处，只会占掉一行高度
-        self.slave_grid.tag_configure("odd", background="#f9fafb")
+        self.slave_grid.tag_configure("odd", background="#f6f8fb")
         self.slave_grid.bind("<Double-1>", self._begin_grid_edit)
+        self.slave_grid.bind("<Motion>", self._slave_hover)
+        self.slave_grid.bind("<Leave>", self._slave_hover_leave)
 
-        # 两个视图叠在同一格；默认亮网格
+        # 两个视图叠在同一格；默认亮概览
         self.slave_grid_wrap.grid(row=0, column=0, sticky="nsew")
         self.slave_detail_wrap.grid(row=0, column=0, sticky="nsew")
         self.slave_detail_wrap.grid_remove()
@@ -1235,61 +1839,89 @@ class ModbusApp:
     # -------------------------------------------------------------- 日志
 
     def _build_log(self) -> None:
-        """日志做成覆盖层：默认收起成状态栏上的一个按钮，点开盖住底部 232px。
+        """日志做成停靠在窗口底部的面板：默认收起，点开展开后数据区让位。
 
-        以前它是常驻的 201px —— 占窗口 26%，比数据表还高。排障要看报文时展开，
-        平时不占地方，看完收起，数据区一点不缩。
+        以前它是 place 覆盖层 —— 直接盖在数据区底部 180px 上，明细表格
+        滚到最后几行正好压在日志底下，「滑到最下面」也看不见（2026-10-24
+        用户报障）。改成真实打包的面板后，打开时整个数据区收缩让位，
+        表格、滚动条、状态栏全部可见，一个像素都不遮。
+        面板归主站页管：切到从站页自动收起，切回来原样恢复（见 _switch_tab）。
         """
-        panel = tk.Frame(self.stack, bg=CARD, highlightthickness=1,
-                         highlightbackground=BORDER)
+        panel = tk.Frame(self.root, bg=CARD, height=232,
+                         highlightthickness=1, highlightbackground=BORDER)
         self.log_panel = panel
         self._log_open = False
 
         head = tk.Frame(panel, bg=CARD)
-        head.pack(fill="x", padx=10, pady=(6, 4))
+        head.pack(fill="x", padx=PAD_CARD, pady=(SP_S, SP_S))
         ttk.Label(head, text="通信日志", style="CardTitle.TLabel").pack(side="left")
-        ttk.Button(head, text="收起", width=5,
-                   command=lambda: self._toggle_log_panel(False)).pack(side="right")
-        ttk.Button(head, text="解析…", width=6,
-                   command=self._open_parser_dialog).pack(side="right", padx=(0, 6))
-        self.log_pause_btn = ttk.Button(head, text="暂停", width=5,
+        # 收起只是关闭，不是一组操作里的一个 —— 用幽灵样式退到背景，
+        # 让「清空/导出/解析」这些有副作用的动作留在视觉前台
+        RoundedButton(head, text="收起", style="Ghost.TButton", bg=CARD,
+                      command=lambda: self._toggle_log_panel(False)).pack(
+                          side="right", padx=(SP_M, 0))
+        # 不带省略号：这三个字本身就是动作，加上「…」只在暗示「后面还有弹窗」，
+        # 而它其实是一个当场打开的面板。
+        RoundedButton(head, text="解析", min_width=72,
+                   command=self._open_parser_dialog, bg=CARD).pack(side="right", padx=(0, SP_S))
+        self.log_pause_btn = RoundedButton(head, text="暂停", min_width=72,
                                         command=self._toggle_log_pause)
-        self.log_pause_btn.pack(side="right", padx=(0, 6))
-        ttk.Button(head, text="导出…", width=6,
-                   command=self._export_log).pack(side="right", padx=(0, 6))
-        ttk.Button(head, text="清空", width=5,
-                   command=self._clear_log).pack(side="right", padx=(0, 6))
+        self.log_pause_btn.pack(side="right", padx=(0, SP_S))
+        # 导出就一个动作：把日志面板里的文字存成 TXT。曾经这里是分裂按钮，
+        # 窄条里揣着「导出 CSV」和「录制数据到 CSV」——前者只是把同样的文字
+        # 换个分隔符，后者是另一件事（数值采样），两样摆一块看着就像重复，
+        # 而现场真正需要的只有「把这段日志存下来」这一件。
+        self.export_btn = RoundedButton(head, text="导出", min_width=72, bg=CARD,
+                                        command=self._export_log)
+        self.export_btn.pack(side="right", padx=(0, SP_S))
+        RoundedButton(head, text="清空", min_width=72,
+                   command=self._clear_log, bg=CARD).pack(side="right", padx=(0, SP_S))
 
         body = tk.Frame(panel, bg=CARD)
-        body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        body.pack(fill="both", expand=True, padx=PAD_CARD, pady=(0, SP_M))
         body.rowconfigure(0, weight=1)
         body.columnconfigure(0, weight=1)
 
-        self.log_text = tk.Text(body, height=8, bg="#f9fafb", fg=TEXT, font=LOG_FONT,
+        self.log_text = tk.Text(body, height=8, bg="#f6f8fb", fg=TEXT, font=LOG_FONT,
                                 relief="flat", wrap="none", state="disabled",
-                                insertbackground=TEXT, padx=8, pady=6)
+                                insertbackground=TEXT, padx=SP_M, pady=SP_M,
+                                spacing1=1, spacing3=1)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         bar = ttk.Scrollbar(body, orient="vertical", command=self.log_text.yview)
-        bar.grid(row=0, column=1, sticky="ns")
+        bar.grid(row=0, column=1, sticky="ns", padx=(SP_XS, 0))
         self.log_text.configure(yscrollcommand=bar.set)
         self.log_text.tag_configure("err", foreground=ERR)
         self.log_text.tag_configure("ok", foreground=OK)
         self.log_text.tag_configure("time", foreground=MUTED, font=MONO)
-        self.log_text.tag_configure("frame", foreground="#61666b", font=MONO)
+                # frame 原来单独用 MONO，中文 fallback 的行高比 Consolas 高，
+        # 于是「帧行」和「读 FC03」两种行高来回跳，扫读一直被切断
+        self.log_text.tag_configure("frame", foreground=MUTED, font=LOG_FONT)
+        self.log_text.tag_configure("fc", foreground=LOG_FC, font=LOG_FONT)
+        self.log_text.tag_configure("payload", foreground=LOG_PAYLOAD, font=MONO)
+        self.log_text.tag_configure("crc", foreground=LOG_CRC, font=MONO)
+        self.log_text.tag_configure("tx", foreground=LOG_DIR_TX, font=LOG_FONT)
+        self.log_text.tag_configure("rx", foreground=LOG_DIR_RX, font=LOG_FONT)
+        # 高度钉死 210px（与旧覆盖层观感一致），内部行高不随内容涨
+        panel.pack_propagate(False)
 
     def _toggle_log_panel(self, show: bool | None = None) -> None:
         if show is None:
             show = not self._log_open
         self._log_open = bool(show)
         if self._log_open:
-            # 上移 30px 让出状态栏：一边看报文一边还要能读到 FC/地址/错误数
-            self.log_panel.place(relx=0, rely=1.0, anchor="sw", relwidth=1,
-                                 height=210, y=-30)
-            self.log_panel.lift()
-            self.log_text.see("end")
+            self._show_log_panel()
         else:
-            self.log_panel.place_forget()
+            self.log_panel.pack_forget()
         self._update_log_button()
+
+    def _show_log_panel(self) -> None:
+        """把日志面板停靠到窗口底部（stack 之下），数据区整体让位。
+
+        after=stack 保证排在数据区之后。参数表单已经收进顶栏的浮层，
+        不再参与这里的 pack 顺序。
+        """
+        self.log_panel.pack(fill="x", after=self.stack)
+        self.log_text.see("end")
 
     def _update_log_button(self) -> None:
         button = getattr(self, "log_toggle_btn", None)
@@ -1299,18 +1931,27 @@ class ModbusApp:
         button.configure(text=f"{arrow} 日志 {self._log_lines}")
 
     def _toggle_log_pause(self) -> None:
-        """暂停只停「往界面上画」，报文该收该记的一点不少 —— 翻旧帧时不被拽回底部。"""
+        """暂停只停「往界面上画」，条目缓存起来，「继续」后原样补回。
+
+        早期实现把暂停期间的条目直接丢掉只留条数 —— 名字叫「暂停」，
+        行为却是「丢弃」，联调时翻旧帧恰恰最容易漏掉暂停那几秒的报文。
+        """
         if not self._log_paused:
-            self._append_log("日志已暂停（新条目只计数，点「继续」恢复）")
+            self._append_log("日志已暂停（新条目缓存，点「继续」补回）")
             self._log_paused = True
             self.log_pause_btn.configure(text="继续")
             return
         self._log_paused = False
         self.log_pause_btn.configure(text="暂停")
-        skipped, self._log_skipped = self._log_skipped, 0
-        if skipped:
-            self._append_log(f"（暂停期间省略 {skipped} 条）")
+        held, self._log_held = self._log_held, []
+        # 批量灌回去：逐条走 _append_log 的话，每条都要 see("end") 一次，
+        # 几千条就是几十秒的白屏。这里只插内容，滚动和计数在循环后统一处理。
+        for text, tag in held:
+            self._emit_log(text, tag)
+        if held:
+            self._append_log(f"（暂停结束，补记 {len(held)} 条）")
         self.log_text.see("end")
+        self._update_log_button()
 
     def _export_log(self) -> None:
         content = self.log_text.get("1.0", "end").strip("\n")
@@ -1388,31 +2029,60 @@ class ModbusApp:
 
     def _append_log(self, text: str, tag: str = "") -> None:
         if self._log_paused:
-            self._log_skipped += 1
+            # 暂停 = 缓存，不是丢弃：恢复时按原顺序补回。
+            # 缓存本身也得有上限 —— 挂着暂停过一夜再点「继续」，几十万条一次性
+            # 补进去会把界面冻住；和主窗口同尺度、按批丢掉最旧的那部分。
+            self._log_held.append((text, tag))
+            if len(self._log_held) > LOG_MAX_LINES:
+                del self._log_held[:LOG_TRIM_STEP]
             return
         # 只有本来就贴在底部时才跟随。否则用户往上翻旧帧，每条新报文都会把他拽回底。
         try:
             at_bottom = self.log_text.yview()[1] >= 0.999
         except Exception:
             at_bottom = True
-        stamp = time.strftime("%H:%M:%S")
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", f"[{stamp}] ", "time")
-        self.log_text.insert("end", text + "\n", tag)
-        self._log_lines += 1
-        if self._log_lines > 400:
-            self.log_text.delete("1.0", "80.0")
-            self._log_lines -= 79
+        self._emit_log(text, tag)
         if at_bottom:
             self.log_text.see("end")
-        self.log_text.configure(state="disabled")
         self._update_log_button()
+
+    def _emit_log(self, text: str, tag: str = "") -> None:
+        """往 Text 里落一条，不负责跟随滚动和按钮计数。
+
+        单独拆出来是为了「补记」：暂停期间攒下的几千条要一次性灌回去，
+        每条都 see("end") + 刷按钮的话，光滚动定位就够卡上十几秒。
+        """
+        # 毫秒级时间戳：相邻报文的间隔本来就在 ms 量级，秒级看不出节奏；
+        # 文件侧（applog）的 .mmm 与这里格式一致，事后对帧能逐条对上。
+        # 用 datetime 的整数微秒除下来，不走 float 取整，避免毫秒进位错秒。
+        now = datetime.now()
+        stamp = f"{now:%H:%M:%S}.{now.microsecond // 1000:03d}"
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", f"[{stamp}] ", "time")
+        # 方向词单独上色：一屏几十帧，最先要看的是「这行是我发的还是它回的」
+        head = text[:2]
+        if head in ("TX", "RX"):
+            self.log_text.insert("end", head, "tx" if head == "TX" else "rx")
+            self.log_text.insert("end", text[2:] + "\n", tag)
+        else:
+            self.log_text.insert("end", text + "\n", tag)
+        # 按真实行数记：一条日志可能自带换行（异常栈、多行提示），只按「条」
+        # 累加的话，窗口里实际行数会比上限大出好几倍。
+        self._log_lines += text.count("\n") + 1
+        if self._log_lines > LOG_MAX_LINES:
+            self.log_text.delete("1.0", f"{LOG_TRIM_STEP + 1}.0")
+            # 一条日志自带换行时（异常栈、多行提示），上面的计数会小于真实
+            # 行数，攒久了窗口就会比上限大。裁剪时按真实行号校准一次。
+            self._log_lines = int(self.log_text.index("end-1c").split(".")[0])
+        self.log_text.configure(state="disabled")
 
     def _clear_log(self) -> None:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
         self._log_lines = 0
+        self._log_held.clear()      # 「清空」是全清：暂停期间还没补回的缓存也一并丢
+        self._update_log_button()   # 计数归零要落到按钮上，不然显示的是清空前的旧数
 
     # ------------------------------------------------------------ 主站逻辑
 
@@ -1446,30 +2116,42 @@ class ModbusApp:
         self.slave_mode_box.set(SLAVE_MODE_LABELS.get(mode, "TCP 监听"))
         self.slave_tcp_frame.pack_forget()
         self.slave_rtu_frame.pack_forget()
-        # RTU/TCP 透传同样监听 TCP 端口，复用地址/端口输入框
+        # RTU over TCP 透传同样监听 TCP 端口，复用地址/端口输入框
         if mode in ("tcp", "rtutcp"):
             self.slave_tcp_frame.pack(fill="x")
         else:
             self.slave_rtu_frame.pack(fill="x")
+        self._sync_crc_field()      # 坏CRC 字段跟模式表态（TCP 帧没有 CRC）
 
     def _on_fc_change(self) -> None:
         fc = FC_OPTIONS[self.fc_box.current()][1]
         is_read = fc in (1, 2, 3, 4)
         if self._polling and not is_read:
-            # 轮询只对读码有意义：切到写码立刻停，别等 5 次失败计数慢慢凑
+            # 轮询只对读码有意义：切到写码立刻停，别等 5 次失败计数慢慢凑。
+            # 记一笔「是被功能码停掉的」，切回读码时好自己接上
+            self._poll_resume_on_read = True
             self._stop_poll()
-        self.read_btn.configure(state="normal" if is_read else "disabled")
-        self.write_btn.configure(state="disabled" if is_read else "normal")
+        self._sync_request_controls()
         self._prev_cells = None
         if is_read:
             self.count_var.configure(state="normal")
             self.write_label.pack_forget()
             self.write_var.pack_forget()
-            self.write_hint.pack_forget()
+            self.write_btn.pack_forget()
+            self.write_hint_row.grid_remove()
+            # 参数区后面接回轮询区（写码下整区折叠过）
+            self._poll_group.pack(side="left", after=self._param_group)
+            if (self._poll_resume_on_read and self.client is not None
+                    and not self._polling):
+                self._poll_resume_on_read = False
+                self._autostart_poll()
         else:
-            self.write_label.pack(side="left", padx=(0, 4), before=self.read_btn)
-            self.write_var.pack(side="left", padx=(0, 4), before=self.read_btn)
-            self.write_hint.pack(side="left", padx=(0, 10), before=self.read_btn)
+            self.write_label.pack(side="left", padx=(0, 4))
+            self.write_var.pack(side="left", padx=(0, 4))
+            self.write_btn.pack(side="left")
+            # 轮询区整区收起：写码下它一个控件都用不上，留着只是占宽
+            self._poll_group.pack_forget()
+            self.write_hint_row.grid(row=1, column=0, sticky="ew")
             limit = write_limit(fc) or 123
             self.count_var.configure(state="disabled")
             if fc == 22:
@@ -1480,16 +2162,18 @@ class ModbusApp:
         self._preview_write()
 
     def _preview_write(self) -> None:
-        """在工具条上实时告诉你：这串值会占几个寄存器。
+        """在工具条下方的预览行实时告诉你：这串值占几个寄存器、落在哪个地址。
 
         FC16 里「填了几个值」和「写了几个寄存器」不是一回事 —— float32 一个值
-        占 2 个、float64 占 4 个。这个数字以前要等发完帧才知道。
+        占 2 个、float64 占 4 个，这个数字以前要等发完帧才知道。而「哪个地址
+        写的是哪个值」从来没人说 —— Modbus Poll / QModMaster 都把地址钉在
+        每一格上，这里的批量写是一根输入条，就得把映射写在提示里。
         """
         label = getattr(self, "write_hint", None)
         if label is None:
             return
         fc = self._current_fc()
-        if fc not in (5, 6, 15, 16):
+        if fc not in (5, 6, 15, 16, 22):
             label.configure(text="")
             return
         raw = _normalize_number(self.write_var.get())
@@ -1509,7 +2193,8 @@ class ModbusApp:
                 return
             # 一个寄存器两个字符，奇数长度要补一个 0x00，所以向上取整
             count = (byte_len + 1) // 2
-            label.configure(text=f"→ {count} 个寄存器（{count * 2} 字符）")
+            tail = self._write_map_ascii(fc, count, raw)
+            label.configure(text=f"→ {count} 个寄存器（{count * 2} 字符）{tail}")
             return
         # 个数统计必须和真正写入时的解析口径一致（parsing.split_values）。
         # 以前这里只替换全角逗号/分号，漏了顿号和半角分号 —— 填 `1、2、3`
@@ -1519,17 +2204,72 @@ class ModbusApp:
             label.configure(text="—")
             return
         if fc == 6:
-            label.configure(text="→ 1 个寄存器")
+            # 口径跟写入路径一致：先查个数再查宽度，报的错才对得上
+            if len(items) != 1:
+                label.configure(text="→ 单点写只能填一个值")
+                return
+            sp = span(self._current_dtype())
+            if sp == 1:
+                label.configure(text=f"→ 1 个寄存器{self._write_map_text(fc, items, 1)}")
+            else:
+                label.configure(text=f"→ 占 {sp} 个寄存器，单点写放不下")
             return
         if fc == 5:
-            label.configure(text="→ 1 个线圈")
+            label.configure(text=f"→ 1 个线圈{self._write_map_text(fc, items, 1)}")
             return
         if fc == 15:
-            label.configure(text=f"→ {len(items)} 个线圈")
+            label.configure(
+                text=f"→ {len(items)} 个线圈{self._write_map_text(fc, items, 1)}")
             return
-        count = len(items) * span(self._current_dtype())
-        # 只报寄存器数：字节数在状态栏和日志里都有，工具条这一行寸土寸金
-        label.configure(text=f"→ {count} 个寄存器")
+        sp = span(self._current_dtype())
+        count = len(items) * sp
+        label.configure(
+            text=f"→ {count} 个寄存器{self._write_map_text(fc, items, sp)}")
+
+    def _write_map_text(self, fc: int, items: list, sp: int) -> str:
+        """「：[100]=1 [101]=2 [102-103]=220.5」—— 每个值落在哪个地址。
+
+        地址解析失败（还没填、记法不对）就退回不带映射，只报数量。
+        映射用表格里显示的地址记法，跟读回来的表能直接对上。
+        """
+        try:
+            addr = self._address_field(fc)
+        except (ValueError, AddressError):
+            return ""
+        base = self._display_address(addr, fc)
+        text = self._register_map(base, items, sp)
+        return f"：{text}" if text else ""
+
+    def _write_map_ascii(self, fc: int, count: int, raw: str) -> str:
+        """ASCII 写入的地址映射：整段字符串落在 [起~止]。"""
+        try:
+            addr = self._address_field(fc)
+        except (ValueError, AddressError):
+            return ""
+        base = self._display_address(addr, fc)
+        shown = raw if len(raw) <= 8 else raw[:7] + "…"
+        return f"：[{base}~{base + count - 1}]=\"{shown}\""
+
+    @staticmethod
+    def _register_map(address: int, items: list, sp: int = 1,
+                      limit: int = 4) -> str:
+        """「[100]=1 [101]=2 [102-103]=220.5」—— 地址到值的映射串。
+
+        sp 是一个值占的寄存器数；超过 limit 个只列前几个，防止提示行被
+        一长串地址占满。
+        """
+        parts = []
+        for i, item in enumerate(items):
+            a = address + i * sp
+            rng = f"{a}" if sp == 1 else f"{a}-{a + sp - 1}"
+            text = f"{item:g}" if isinstance(item, float) else str(item)
+            if len(text) > 10:
+                text = text[:9] + "…"
+            parts.append(f"[{rng}]={text}")
+            if len(parts) >= limit and i + 1 < len(items):
+                parts.append(f"…（共 {len(items)} 个）")
+                break
+        return " ".join(parts)
 
     def _build_transport(self):
         mode = self.link_mode.get()
@@ -1537,6 +2277,10 @@ class ModbusApp:
             timeout = float(self.timeout_var.get())
         except ValueError:
             raise ValueError("超时时间必须是数字") from None
+        # 按键护栏只拦 >30 和非数字，手敲 0 也进得来 —— 超时 0 秒等于
+        # 永远连不上/读不上，必须在参数层拦下并给出台阶
+        if not 0.1 <= timeout <= 30:
+            raise ValueError("超时时间要在 0.1~30 秒之间")
         if mode in ("tcp", "rtutcp"):
             host = self.tcp_host.get().strip() or "127.0.0.1"
             try:
@@ -1574,14 +2318,16 @@ class ModbusApp:
             return
         try:
             transport = self._build_transport()
-            unit = self._int_field(self.unit_var, "站地址", 1, 247)
+            unit = self._int_field(self.unit_var, "设备地址", 1, 247)
             retries = self._int_field(self.retry_var, "重试次数", 0, 5)
         except (ValueError, RuntimeError) as exc:
             self._notify(f"参数有误：{exc}", error=True)
             return
 
         self._busy = True
-        self.connect_btn.configure(state="disabled", text="连接中…")
+        # 文案取「连接中」而不是「连接中…」：定宽 96 正好容下三种状态，
+        # 按钮不会在连接瞬间抽一下，右边的状态胶囊也就不会跟着跳
+        self.connect_btn.configure(state="disabled", text="连接中")
         self._log(f"正在连接 {transport.label} …")
 
         client = ModbusClient(transport, unit, retries, on_log=self._client_log)
@@ -1595,14 +2341,48 @@ class ModbusApp:
             self._busy = False
             self.connect_btn.configure(state="normal", text="断开")
             if error:
+                reason = self._friendly_error(error)
                 self.connect_btn.configure(text="连接")
                 self._set_link_state(False, "连接失败")
-                self._log(f"连接失败：{self._friendly_error(error)}", "err")
+                # 失败原因必须进状态栏 —— 只写日志的话，用户看到的就是
+                # 「点了没反应」：按钮闪一下回到「连接」，别的什么都没有
+                self.master_status.configure(text=f"连接失败：{reason}", foreground=ERR)
+                self._log(f"连接失败：{reason}", "err")
                 return
             self.client = result
             self._set_link_state(True, transport.label)
             self._refresh_stats()
-            self._log(f"已连接 {transport.label}，站地址 {unit}", "ok")
+            self._log(f"已连接 {transport.label}，设备地址 {unit}", "ok")
+            # 连成了才记：这组参数已被证明能用，值得成为下次的默认值
+            self._save_link_settings()
+            # 「我没起从站怎么也连上了」最常见的一个答案：连到了本页自己
+            # 启动的从站（本机自环联调）。自家这个能精确对上，点一句；
+            # 另一个实例的从站这里看不到 —— 但 TCP 能连上就说明那头真有
+            # 人在监听，本机 502 被占时先想这一层。
+            host = getattr(transport, "host", None)
+            unit_mismatch = False
+            if (host in ("127.0.0.1", "localhost", "::1")
+                    and self.server is not None
+                    and getattr(transport, "port", None) == self.server.port):
+                self._log(f"自环联调：{host}:{transport.port} 是本页启动的从站", "ok")
+                # 站地址对不上时趁连接这一刻就说破，别等用户读到超时才猜原因
+                try:
+                    if int(unit) != int(self.server.unit):
+                        unit_mismatch = True
+                        self._log(f"注意：主站设备地址 {unit} 与从站站地址 "
+                                  f"{self.server.unit} 不一致 —— 从站不会应答，"
+                                  f"读取会超时，把主站「设备地址」改成 "
+                                  f"{self.server.unit}", "err")
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            # 上面那些一次性提示都说完之后再开轮询：轮询一跑，状态栏就被
+            # 「轮询中 · 地址 …」长期占住，连接瞬间最该看的那句话会被顶掉。
+            # 已知站地址对不上就别开了 —— 五次超时只会把这句提示刷出视野。
+            if unit_mismatch:
+                self._log("设备地址不一致，已跳过自动轮询", "err")
+            else:
+                # 先静默问一句「对面是谁」，再进入轮询
+                self._probe_device_then_poll()
 
         self._async(work, done)
 
@@ -1620,14 +2400,20 @@ class ModbusApp:
             self._link_text = ""
             self._link_health = "off"
             self._fail_streak = 0
+            # 断开就清掉，否则下次连另一台设备时胶囊还挂着上一台的型号
+            self._device_note = ""
         self._render_link()
+        connected_now = self.client is not None
         self.connect_btn.configure(text="断开" if connected else "连接")
-        self.env_label.configure(text=text)
-        # 连上就把参数条收起来，把 40px 还给数据区；断开时再露出来
-        if connected:
-            self.connect_bar.pack_forget()
-        else:
-            self.connect_bar.pack(fill="x", before=self.stack)
+        # 浮层底部那颗按钮跟着状态走：连着的时候点它就是断开，
+        # 文案还写「连接」会让人以为要重连
+        self.conn_go.configure(
+            text="断开" if connected_now else "连接",
+            style="Danger.TButton" if connected_now else "Accent.TButton")
+        # 连接按钮/状态灯/浮层的去留统一交给 _sync_master_chrome：
+        # 它同时看「在哪个页」和「连没连」，在从站页断开也不会把主站
+        # 控件弹到从站页上
+        self._sync_master_chrome()
 
     def _require_client(self) -> ModbusClient | None:
         if self.client is None:
@@ -1655,12 +2441,41 @@ class ModbusApp:
             raise ValueError(f"{label}不能大于 {maximum}")
         return value
 
+    def _unit_mismatch_hint(self) -> str | None:
+        """本机自环下主站站地址与从站不一致的人话提示；其余场景返回 None。
+
+        TCP 从站对站地址不符的请求是「静默丢弃」（协议标准行为）——
+        TCP 能连上只说明端口有人在听，读却只能等超时。这是「连接成功
+        但读取不行」最常见的原因。只有连的是本页自己启动的从站时才能
+        精确对出这个错，连别的设备时不乱猜。
+        """
+        client, server = self.client, self.server
+        if client is None or server is None:
+            return None
+        host = getattr(client.transport, "host", None)
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return None
+        if getattr(client.transport, "port", None) != server.port:
+            return None
+        try:
+            if int(client.unit) == int(server.unit):
+                return None
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return (f"主站设备地址 {client.unit} 与本从站站地址 {server.unit} 不一致，"
+                f"从站不会应答 —— 把主站「设备地址」改成 {server.unit}")
+
     def _friendly_error(self, exc: BaseException) -> str:
         """给用户看的错误一句话；英文原文（Python 内部错误）只写日志。"""
         text = describe_error(exc).strip() or exc.__class__.__name__
         if not any("\u4e00" <= ch <= "\u9fff" for ch in text):
             self._log(f"内部错误：{exc.__class__.__name__}: {text}", "err")
             return "操作失败（内部错误），细节已写入日志"
+        # 超时类失败 + 本机自环 + 站地址不一致：把最可能的原因直接递到眼前，
+        # 不让用户在「连接成功却读不通」里干瞪眼
+        hint = self._unit_mismatch_hint()
+        if hint and any(k in text for k in ("超时", "无响应", "timed out")):
+            return f"{text}（{hint}）"
         return text
 
     def _parse_write_values(self, fc: int, dtype: str | None = None) -> list | None:
@@ -1668,7 +2483,7 @@ class ModbusApp:
 
         GUI 只负责把错误变成状态栏提示 —— 早期这里自己切分，分隔符集合
         与 CLI 不一致（少了中文顿号），两边对同一串输入的解释会不一样。
-        dtype 可强制覆盖「数据解释」弹层里选的类型（掩码写固定按整数解析）。
+        dtype 可强制覆盖「数据定义」弹层里选的类型（掩码写固定按整数解析）。
         """
         raw = self.write_var.get().strip()
         if not raw:
@@ -1680,8 +2495,13 @@ class ModbusApp:
             self._notify(str(exc), error=True)
             return None
 
-    def _do_read_async(self, note: str = "") -> None:
-        """读一次。note 非空时，读完后状态栏先显示它（写后回读用）。
+    def _read_once(self, note: str = "") -> None:
+        """读一次，不改变轮询状态。
+
+        界面上已经没有「读取」按钮 —— 数据由轮询持续刷新。这个原语仍要留着，
+        两个用途：① 写入后的回读确认（不校验就等于「发出去了」而不是「写成了」）；
+        ② F5 在轮询停止的情况下手动补读一次。
+        note 非空时，读完后状态栏先显示它（写后回读用）。
 
         不这么做的话，「已写入 2 个寄存器」会被紧接着的「FC03 地址 0 共 10 点」
         冲掉 —— 而这恰恰是用户最想确认的那句话。
@@ -1694,41 +2514,66 @@ class ModbusApp:
             self._notify("当前功能码是写操作，请点“写入”", error=True)
             return
         limit = read_limit(fc) or 125
+        if self._validate_view_inputs(notify=True) is None:
+            return
         try:
-            address = self._resolve_address(
-                self._int_field(self.addr_var, "起始地址", 0, 65535), fc)
+            address = self._address_field(fc)
             count = self._int_field(self.count_var, "数量", 1, limit)
         except (ValueError, AddressError) as exc:
             self._notify(f"参数有误：{exc}", error=True)
             return
 
-        self._begin_request(
+        request_id = self._begin_request(
             f"读取中…（超时 {self.timeout_var.get()} s，重试 {self.retry_var.get()} 次）")
+        if request_id is None:
+            return
+        callback = lambda values, error: self._on_read_done(
+            values, error, address, fc, note, request_id)
         self._async(lambda: client.read(fc, address, count),
-                    lambda values, error: self._on_read_done(values, error, address, fc, note))
+                    self._request_callback(request_id, callback))
 
-    def _begin_request(self, text: str) -> None:
-        """请求期间给个明确反馈。
-
-        超时 2s × 重试 3 时，界面会有近 8 秒毫无动静 —— 只把按钮变灰，
-        用户会以为程序卡死，然后去点第二次。
-        """
-        self.read_btn.configure(state="disabled")
-        self.write_btn.configure(state="disabled")
+    def _begin_request(self, text: str) -> int | None:
+        """开启唯一主站请求，返回请求编号；按钮和快捷键共用这道闸。"""
+        if self._request_active:
+            self.master_status.configure(text="上一请求尚未完成，请等待或先停止轮询",
+                                         foreground=WARN)
+            return None
+        self._request_active = True
+        self._request_seq += 1
+        self._sync_request_controls()
         self.master_status.configure(text=text, foreground=MUTED)
+        return self._request_seq
 
-    def _end_request(self) -> None:
+    def _sync_request_controls(self) -> None:
+        active = self._request_active
         is_read = self._current_fc() in (1, 2, 3, 4)
-        self.read_btn.configure(state="normal" if is_read else "disabled")
-        self.write_btn.configure(state="disabled" if is_read else "normal")
+        self.write_btn.configure(state="disabled" if is_read or active else "normal")
+        self.poll_btn.configure(state="disabled" if active else "normal")
+        self.fc_box.configure(state="disabled" if active else "readonly")
+        self.connect_btn.configure(state="disabled" if active else "normal")
 
-    def _on_read_done(self, values, error, address: int, fc: int, note: str = "") -> None:
-        self._end_request()
+    def _end_request(self, request_id: int | None = None) -> None:
+        if request_id is not None and request_id != self._request_seq:
+            return
+        self._request_active = False
+        self._sync_request_controls()
+
+    def _request_callback(self, request_id: int, callback):
+        """丢弃已经过期或属于旧链路的回调，避免旧结果覆盖新状态。"""
+        def done(result, error):
+            if request_id != self._request_seq:
+                return
+            callback(result, error)
+        return done
+
+    def _on_read_done(self, values, error, address: int, fc: int, note: str = "",
+                      request_id: int | None = None) -> None:
+        self._end_request(request_id)
         if error:
             reason = self._friendly_error(error)
             self.master_status.configure(text=f"读取失败：{reason}", foreground=ERR)
             self._log(f"读取失败：{reason}", "err")
-            self._mark_link(False)
+            self._mark_link(False, replied=self._replied(error))
             self._refresh_stats()
             return
         self._mark_link(True)
@@ -1742,12 +2587,14 @@ class ModbusApp:
             text = f"FC{fc:02d} 地址 {address} 共 {len(values)} 点{extra}"
         self.master_status.configure(text=text, foreground=MUTED)
         self._refresh_stats()
-        self._csv_record(fc, address, values)
 
     # -- 设备识别（FC2B）---------------------------------------------------
 
     def _identify_device_async(self) -> None:
-        """读一次设备标识：厂商名、产品代码、版本号，联调时先确认对面是谁。
+        """主动读一次设备标识（右键菜单 / Ctrl+I）。
+
+        与连上时那次静默探测分工不同：这里是用户明确要问，所以用正常超时
+        与重试，失败也一定在状态栏说明原因 —— 点了没反应比报错更让人困惑。
 
         注意 client.read_device_id() 返回的是 {对象号: 值}，名字映射在这边补
         （core.read_device_id 才返回带 name 字段的结构）。
@@ -1755,66 +2602,28 @@ class ModbusApp:
         client = self._require_client()
         if client is None:
             return
-        self._begin_request("正在读设备标识…")
+        request_id = self._begin_request("正在读设备标识…")
+        if request_id is None:
+            return
 
         def done(result, error):
-            self._end_request()
+            self._end_request(request_id)
             if error:
                 self._notify(f"设备识别失败：{self._friendly_error(error)}", error=True)
-                self._mark_link(False)
+                self._mark_link(False, replied=self._replied(error))
                 self._refresh_stats()
                 return
+            # 先落到胶囊再 mark_link（后者会重画胶囊），主动查到的名字同样该贴上
+            self._device_note = self._device_summary(result)
             self._mark_link(True)
             self._refresh_stats()
-            items = " · ".join(
-                f"{DEVICE_ID_OBJECTS.get(oid, f'对象 {oid}')}={value}"
-                for oid, value in sorted(result.items()))
+            items = self._device_items(result)
             latency = client.last_latency_ms
             extra = f" · {latency:.1f} ms" if latency is not None else ""
             self.master_status.configure(text=f"设备标识：{items}{extra}", foreground=MUTED)
             self._log(f"设备识别（FC2B）：{items}{extra}", "ok")
 
         self._async(lambda: client.read_device_id(), done)
-
-    # -- CSV 记录 ----------------------------------------------------------
-
-    def _toggle_csv(self) -> None:
-        if self._csv is None:
-            path = _default_csv_path()
-            try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                self._csv = _CsvSession(path)
-            except OSError as exc:
-                self._csv = None
-                self.csv_var.set(False)
-                self._notify(f"无法创建 CSV 文件：{exc}", error=True)
-                return
-            self.csv_check.configure(text="记录中…")
-            self._log(f"开始记录 CSV：{path}", "ok")
-            return
-        rows, self._csv = self._csv.rows, None
-        self._csv_close_quiet()
-        self.csv_check.configure(text="记录 CSV")
-        self._log(f"CSV 记录已停止（{rows} 行）", "ok")
-
-    def _csv_close_quiet(self) -> None:
-        if self._csv is not None:
-            self._csv.close()
-            self._csv = None
-
-    def _csv_record(self, fc: int, address: int, values: list) -> None:
-        """读成功后落一行：时间, 功能码, 地址, 各寄存器原始值。"""
-        if self._csv is None or not values:
-            return
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            self._csv.write([stamp, f"FC{fc:02d}", address]
-                            + [int(v) for v in values])
-        except (OSError, ValueError) as exc:
-            self._csv_close_quiet()
-            self.csv_var.set(False)
-            self.csv_check.configure(text="记录 CSV")
-            self._log(f"CSV 写入失败，已停止记录：{exc}", "err")
 
     # -- 类型与地址 --------------------------------------------------------
 
@@ -1826,41 +2635,49 @@ class ModbusApp:
         index = self.dtype_box.current()
         return DTYPE_OPTIONS[index if index >= 0 else 0][1]
 
-    def _current_scale(self) -> float:
-        """系数输入框的容错解析。以前同样的 try/except 抄了 6 处。
-
-        无效**或为 0** 都回退 1.0 并记一条日志：0 是合法 float 却无物理意义
-        （decode 全归零、encode 除零），静默放行会伪装成「设备读不到数据」。
-        轮询时这个方法每个周期都会被调到，所以只在输入内容变化时提示一次。
-        """
-        raw = self.scale_var.get()
+    @staticmethod
+    def _finite_number(raw: str, label: str, *, zero: bool) -> float:
+        text = _normalize_number(raw).strip()
         try:
-            value = float(raw or 1)
+            value = float(text)
+        except (TypeError, ValueError):
+            raise ValueError(f"{label}必须是数字（当前为「{text or '空'}」）") from None
+        if not math.isfinite(value):
+            raise ValueError(f"{label}必须是有限数，不能为 NaN 或无穷大")
+        if not zero and value == 0:
+            raise ValueError(f"{label}不能为 0，否则无法正确换算物理量")
+        return value
+
+    def _validate_view_inputs(self, *, notify: bool = False) -> tuple[float, float] | None:
+        """读写前校验换算参数；输入过程只显示字段错误，不弹模态框。"""
+        try:
+            scale = self._finite_number(self.scale_var.get(), "系数", zero=False)
+            bias = self._finite_number(self.bias_var.get(), "偏移", zero=True)
+        except ValueError as exc:
+            message = str(exc)
+            label = getattr(self, "view_error", None)
+            if label is not None:
+                label.configure(text=message)
+            if notify:
+                self._notify(f"数据定义有误：{message}", error=True)
+            return None
+        label = getattr(self, "view_error", None)
+        if label is not None:
+            label.configure(text="")
+        return scale, bias
+
+    def _current_scale(self) -> float:
+        """显示层容错值；任何实际读写都必须先过 _validate_view_inputs。"""
+        try:
+            return self._finite_number(self.scale_var.get(), "系数", zero=False)
         except ValueError:
-            value = 1.0
-            reason = f"系数「{raw}」不是数字，已按 1 处理"
-        else:
-            if value != 0:
-                return value
-            reason = "系数不能为 0（读数会全部归零），已按 1 处理"
-        if raw != getattr(self, "_scale_warned_raw", None):
-            self._scale_warned_raw = raw
-            self._log(reason, "err")
-        return 1.0
+            return 1.0
 
     def _current_bias(self) -> float:
-        """偏移输入框的容错解析，与 core.read/write 的 bias 语义一致。
-
-        bias=0 是合法值（无偏移），这里只拦「不是数字」；同样按输入内容
-        节流提示，避免轮询时刷屏。
-        """
-        raw = self.bias_var.get()
+        """显示层容错值；任何实际读写都必须先过 _validate_view_inputs。"""
         try:
-            return float(raw or 0)
+            return self._finite_number(self.bias_var.get(), "偏移", zero=True)
         except ValueError:
-            if raw != getattr(self, "_bias_warned_raw", None):
-                self._bias_warned_raw = raw
-                self._log(f"偏移量「{raw}」不是数字，已按 0 处理", "err")
             return 0.0
 
     def _on_dtype_change(self) -> None:
@@ -1883,6 +2700,46 @@ class ModbusApp:
         """界面地址 → 协议地址。实现见 addressing.resolve_address。"""
         mode = "plc" if self.plc_var.get() else "protocol"
         protocol, _area = resolve_address(fc, address, mode)
+        return protocol
+
+    def _address_field(self, fc: int) -> int:
+        """按当前记法解析地址，最终统一检查协议地址范围。
+
+        带 0x / 0b 前缀的字面量自带进制，也自带含义：它是**协议地址**，不是
+        PLC 编号（PLC 编号按手册的写法是 40001 这种十进制）。所以前缀优先于
+        下拉 —— 不管下拉停在哪一档，0x4000 读的都是 16384 号寄存器。不这样，
+        同一串 0x4000 在十进制记法下是 16384、切到 PLC 记法却成了「PLC 编号
+        16384」，报一句「属于离散输入」，而用户只看到「0x4000 不能用」。
+        """
+        raw = _normalize_number(self.addr_var.get()).strip()
+        literal = raw.lower().startswith(("0x", "0b"))
+        if literal and not self._addr_hex.get():
+            # 框里写着 0x，就是用户当场声明「这是十六进制地址」——比下拉更具体。
+            # 这里只同步记法与下拉文字，不动框里的字。放在解析函数里而不是只挂
+            # KeyRelease，是因为读、写、预览、表头都从这条路走：粘贴、程序化赋值
+            # 不产生松键事件，靠事件会漏，一漏就是「框里 0x4000、表头 416385」。
+            self._addr_hex.set(True)
+            self.plc_var.set(False)
+            self._sync_addr_notation()
+        try:
+            if literal:
+                value = _parse_int(raw)
+            elif self._addr_hex.get() and not self.plc_var.get():
+                # 十六进制记法下裸写的「1A」就是 0x1A：选了十六进制还要人再补
+                # 一个 0x，等于把这个下拉白设。带 0x 的写法照样认。
+                value = int(raw, 16)
+            else:
+                value = _parse_int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"起始地址格式无效：「{raw or '空'}」") from None
+        if literal or not self.plc_var.get():
+            if not 0 <= value <= 65535:
+                raise ValueError("协议地址必须在 0 ~ 65535（或 0x0000 ~ 0xFFFF）之间")
+        elif value < 1:
+            raise ValueError("PLC 地址必须大于 0")
+        protocol = value if literal else self._resolve_address(value, fc)
+        if not 0 <= protocol <= 65535:
+            raise ValueError("换算后的协议地址超出 0 ~ 65535")
         return protocol
 
     def _client_log(self, text: str) -> None:
@@ -1930,12 +2787,31 @@ class ModbusApp:
         if label is None:
             return
         if self._current_dtype() != "ascii" or self._last_read is None:
-            label.configure(text="")
+            self._set_status_extra(label, "")
             return
         values, _ = self._last_read
         text = "".join(decode(values, "ascii", self.byteorder_box.get() or "ABCD"))
         text = text.rstrip(NONPRINT)
-        label.configure(text=f'"{text}"' if text else "")
+        self._set_status_extra(label, f'"{text}"' if text else "")
+
+    def _set_status_extra(self, label, text: str) -> None:
+        """状态栏里那两段可选提示（光标定位 / ASCII 预览）：有内容才露出来。
+
+        空 Label 也占着几像素白底，和左边的连接状态并排看就像三道没有任何
+        含义的白条 —— 用户确实问过「左下角这三个白条是干什么的」。
+        没内容时收起，有内容时按固定顺序（状态 → 光标 → ASCII）补回去。
+        """
+        label.configure(text=text)
+        if text:
+            if not label.winfo_manager():
+                if label is getattr(self, "cursor_label", None) and \
+                        getattr(self, "ascii_label", None) is not None and \
+                        self.ascii_label.winfo_manager():
+                    label.pack(side="left", padx=(16, 0), before=self.ascii_label)
+                else:
+                    label.pack(side="left", padx=(16, 0))
+        elif label.winfo_manager():
+            label.pack_forget()
 
     # -- 写入范围框选 -----------------------------------------------------
 
@@ -2043,14 +2919,14 @@ class ModbusApp:
     def _grid_fmt(self) -> str:
         """「格式」下拉当前生效的值。
 
-        格式（值/HEX/BIN）只有网格视图有语义；明细视图里控件虽然被禁用，
-        但 `get()` 仍然返回上次选的 HEX/BIN —— 直接读控件会让
+        格式（数值/十六进制/二进制）只有概览视图有语义；明细视图里这一对控件
+        整组收起，但 `get()` 仍然返回上次选的十六进制/二进制 —— 直接读控件会让
         `_cell_step()` 以为「一格一个寄存器」，进而把就地写的地址算成
         `address + index * 1`（正确值是一格 span 个寄存器），
         写错地址的同时还按十六进制解析用户输入。所有需要格式的地方
         必须走这个函数。
         """
-        return self.master_fmt_box.get() if self._master_grid else "值"
+        return self.master_fmt_box.get() if self._master_grid else FMT_VALUE
 
     def _addr_text(self, address: int, fc: int) -> str:
         shown = self._display_address(address, fc)
@@ -2070,10 +2946,15 @@ class ModbusApp:
         fc = self._current_fc()
         if fc in (1, 2) and len(values) > MAX_DETAIL_ROWS:
             # 状态栏照报总点数，表里只画前 MAX_DETAIL_ROWS 行 —— 让界面
-            # 卡死的「功能」比少渲染更糟
-            self._log(f"明细视图只渲染前 {MAX_DETAIL_ROWS} 行（本次读到 {len(values)} 点），"
-                      "大范围请用网格视图或缩小数量", "err")
+            # 卡死的「功能」比少渲染更糟。这条提示只在点数变化时记一次：
+            # 轮询每 500 ms 重画一遍，每次都记就是每秒两条把日志刷满。
+            if self._detail_trunc != len(values):
+                self._detail_trunc = len(values)
+                self._log(f"明细视图只渲染前 {MAX_DETAIL_ROWS} 行（本次读到 {len(values)} 点），"
+                          "大范围请用概览视图或缩小数量", "err")
             values = values[:MAX_DETAIL_ROWS]
+        else:
+            self._detail_trunc = None
         rows: list[tuple] = []
         cells: list[str] = []
 
@@ -2128,17 +3009,19 @@ class ModbusApp:
             return
 
         fmt = self._grid_fmt()
-        if fmt == "HEX":
-            self._emit_cells(tree, values, address, fc, per, 1, 66, "e",
-                             lambda r: f"{r:04X}")
+        if fmt == FMT_HEX:
+            # 带 0x 前缀：这是 C / Python / 汇编里通用的十六进制写法，
+            # 一眼就能和十进制单元格区分开，复制出去也能直接被解析。
+            self._emit_cells(tree, values, address, fc, per, 1, 82, "e",
+                             lambda r: f"0x{r:04X}")
             return
-        if fmt == "BIN":
+        if fmt == FMT_BIN:
             # 分组后一格 19 个字符，每行 4 格仍不必横向滚动
             self._emit_cells(tree, values, address, fc, 4, 1, 150, "w",
                              self._bin_text)
             return
 
-        # 值：按类型解码；网格里不放单位，纯数字更像仪表
+        # 值：按类型解码；概览里不放单位，纯数字更像仪表
         dtype = self._current_dtype()
         step = span(dtype)
         decoded = decode(values, dtype, self.byteorder_box.get() or "ABCD",
@@ -2294,9 +3177,9 @@ class ModbusApp:
                            fill=ACCENT, outline="")
 
     def _cell_step(self) -> int:
-        """表格里一格代表几个寄存器：HEX/BIN/位区一格就是一个。"""
+        """表格里一格代表几个寄存器：十六进制/二进制/位区一格就是一个。"""
         fc = self._current_fc()
-        if fc in (1, 2) or self._grid_fmt() in ("HEX", "BIN"):
+        if fc in (1, 2) or self._grid_fmt() in (FMT_HEX, FMT_BIN):
             return 1
         return span(self._current_dtype())
 
@@ -2358,7 +3241,7 @@ class ModbusApp:
         label = getattr(self, "cursor_label", None)
         if label is None:
             return
-        label.configure(text=text or "")
+        self._set_status_extra(label, text or "")
 
     # -- 右键复制 ---------------------------------------------------------
 
@@ -2366,6 +3249,11 @@ class ModbusApp:
         menu = tk.Menu(tree, tearoff=0)
         menu.add_command(label="复制该格", command=lambda: self._copy_cell(tree))
         menu.add_command(label="复制整表（TSV）", command=lambda: self._copy_table(tree))
+        # 设备标识是「偶尔要看一眼」的信息，常驻工具条太占地方，放右键刚好：
+        # 不占位、入口可发现（对着表格右键是最自然的动作），而且这里失败会
+        # 明确报错 —— 和连上时那次静默探测正好分工，一个不打扰，一个有回音。
+        menu.add_separator()
+        menu.add_command(label="读取设备标识", command=self._identify_device_async)
         tree._copy_menu = menu       # 留个引用，否则菜单被回收就弹不出来
 
     def _on_table_menu(self, event):
@@ -2490,12 +3378,12 @@ class ModbusApp:
         text = _normalize_number(text)
         fmt = self._grid_fmt()
         try:
-            if fmt == "HEX":
-                raw = _parse_int(text)
+            if fmt == FMT_HEX:
+                raw = _parse_int(text)          # 0x 前缀可有可无，parse_int 都认
                 if not 0 <= raw <= 0xFFFF:
                     raise ValueError("超出 0 ~ 0xFFFF")
                 payload, write_fc = [raw], 6
-            elif fmt == "BIN":
+            elif fmt == FMT_BIN:
                 raw = int(text.replace(" ", ""), 2)
                 if not 0 <= raw <= 0xFFFF:
                     raise ValueError("超出 16 位范围")
@@ -2508,7 +3396,7 @@ class ModbusApp:
                         "ASCII 一格只放 2 个字符；写长字符串请用工具条的「写入」")
                 original = self._register_at(address)
                 if original is None:
-                    raise ValueError("这格不在当前读取范围内，请先读一次再改")
+                    raise ValueError("这格不在当前轮询范围内，请先按 F5 补读一次再改")
                 payload = [patch_ascii(text, original,
                                        self.byteorder_box.get() or "ABCD")]
                 write_fc = 6
@@ -2538,7 +3426,7 @@ class ModbusApp:
             if error:
                 reason = self._friendly_error(error)
                 self._notify(f"写入失败：{reason}", error=True)
-                self._mark_link(False)
+                self._mark_link(False, replied=self._replied(error))
                 self._refresh_stats()
                 return
             self._mark_link(True)
@@ -2550,7 +3438,7 @@ class ModbusApp:
             self._refresh_stats()
             self._mark_written(address, len(payload))
             # 整屏回读，确认真的落到了从站；把写入摘要带过去，别被读结果冲掉
-            self._do_read_async(f"已写入 地址 {address} = {text} · {counted} {noun}")
+            self._read_once(f"已写入 地址 {address} = {text} · {counted} {noun}")
 
         self._async(lambda: client.write(write_fc, address, payload), done)
 
@@ -2565,18 +3453,18 @@ class ModbusApp:
             if error:
                 reason = self._friendly_error(error)
                 self._notify(f"写线圈失败：{reason}", error=True)
-                self._mark_link(False)
+                self._mark_link(False, replied=self._replied(error))
                 self._refresh_stats()
                 return
             self._mark_link(True)
             self._notify(f"线圈 地址 {address} 已置 {value}，正在回读确认")
             self._refresh_stats()
-            self._do_read_async()          # 整屏回读，比只读一个点有用
+            self._read_once()          # 整屏回读，比只读一个点有用
 
         self._async(lambda: client.write(5, address, [value]), done)
 
 
-    # -- 视图切换（网格 ↔ 明细），tests 也走这两个入口 -------------------
+    # -- 视图切换（概览 ↔ 明细），tests 也走这两个入口 -------------------
 
     def _on_display_change(self) -> None:
         """换格式/换地址记法：这一屏整体变了，不算「数据变化」。"""
@@ -2610,7 +3498,7 @@ class ModbusApp:
         return " ".join(parts)
 
     def _sync_view_state(self) -> None:
-        """把「数据解释」的当前取值存下来，弹层重建时恢复。
+        """把「数据定义」的当前取值存下来，弹层重建时恢复。
 
         单独一个方法：以前这段写在 `_view_summary()` 里，于是一个叫
         summary 的纯读取函数顺带改状态 —— 任何新增的「读摘要」调用点
@@ -2626,67 +3514,114 @@ class ModbusApp:
             "plc": self.plc_var.get(),
         }
 
+    def _update_empty_hint(self) -> None:
+        """数据区空着的时候说清楚在等什么。"""
+        try:
+            tree = self.result_grid if self._master_grid else self.result_tree
+            rows = len(tree.get_children())
+        except (AttributeError, tk.TclError):
+            return
+        if rows:
+            self.empty_hint.place_forget()
+            return
+        if self.client is None:
+            title = "尚未连接"
+            # 主键是「直接连」，改参数才走右边那一格。这里不用 ▾ 这个字形
+            # 指路：9pt 的中文字体里它只画出一个小点，看着像标点错误。
+            desc = "点右上角「连接」直接连；要改 IP / 串口点它右边的小箭头"
+        else:
+            title = "等待数据"
+            desc = "轮询进行中；也可以按 F5 手动读取一次"
+        if self.empty_title.cget("text") != title:
+            self.empty_title.configure(text=title)
+        self.empty_desc.configure(text=desc)
+        self.empty_hint.place(relx=0.5, rely=0.42, anchor="center")
+
     def _refresh_stats(self) -> None:
+        self._update_empty_hint()
         summary = self._view_summary()
         client = self.client
         if client is None:
             self.stats_label.configure(text=summary)
             return
-        latency = client.last_latency_ms
         # request_count 只记「收到应答」的次数，error_count 记失败尝试（含重试），
         # 所以失败数可能比成功数大 —— 那说明链路在抖，正是要看见的信息。
+        # 耗时不在这一侧重复：左侧过程描述里已经报了这次请求的往返时间。
         parts = [summary, f"成功 {client.request_count}", f"失败 {client.error_count}"]
-        if latency is not None:
-            parts.append(f"{latency:.1f} ms")
         self.stats_label.configure(text=" · ".join(parts))
 
     def _toggle_master_view(self) -> None:
         self.set_master_view(not self._master_grid)
 
+    def _sync_master_view_switch(self) -> None:
+        self._sync_view_button(self.master_view_btn, self._master_grid)
+
     def set_master_view(self, grid: bool) -> None:
         self._master_grid = grid
         self._prev_cells = None
+        # 光标提示说的是「刚才那个视图里那一格」，切过去就过期了：
+        # 概览切明细后，状态栏还挂着「0x0007 = 0x0A0B」，可那个格子已经不在了
+        self._set_cursor_hint(None)
         if grid:
             self.detail_wrap.grid_remove()
             self.grid_wrap.grid(row=0, column=0, sticky="nsew")
-            self.master_view_btn.configure(text="明细")
+            # 按原位置把「格式」这一对插回：标签在左、下拉在右、切换按钮在最右
+            self.master_fmt_box.pack(side="left", padx=(0, 10), before=self.master_view_btn)
+            self.fmt_label.pack(side="left", padx=(0, 4), before=self.master_fmt_box)
             self.master_fmt_box.configure(state="readonly")
         else:
             self.grid_wrap.grid_remove()
             self.detail_wrap.grid(row=0, column=0, sticky="nsew")
-            self.master_view_btn.configure(text="网格")
-            # 明细视图的「值」列永远是物理量，格式下拉在这里没有意义。
-            # 只置灰不重置，会让控件带着 HEX/BIN 的旧值回到网格视图。
-            self.master_fmt_box.set("值")
-            self.master_fmt_box.configure(state="disabled")
+            # 明细视图本身就是「数值 / 十六进制 / 二进制三列并列」，格式下拉
+            # 在这里没有事可做。以前是置灰：一个灰控件常驻最右边，既占宽度
+            # 又要用户去猜「它为什么是灰的」；整组收起，原因就不言自明。
+            # 收起的只是控件，用户选的值留着：回到概览还是他原来选的十六进制。
+            # 这里以前顺手 set(FMT_VALUE)，于是「切明细看一眼再回来」就把
+            # 选好的格式悄悄改回数值 —— 而 _grid_fmt() 本来就只在概览视图
+            # 认这个控件，不需要靠重置来防它带偏。
+            self.master_fmt_box.pack_forget()
+            self.fmt_label.pack_forget()
+        self._sync_master_view_switch()
         self._render_master_data()
 
     def _build_slave_view_actions(self, head) -> None:
-        self.slave_view_btn = ttk.Button(head, text="明细", width=6,
-                                         command=self._toggle_slave_view)
-        self.slave_view_btn.pack(side="right")
-        self.slave_fmt_box = ttk.Combobox(head, values=("十进制", "有符号", "HEX", "BIN"),
-                                          state="readonly", width=6)
-        self.slave_fmt_box.set("十进制")
-        self.slave_fmt_box.pack(side="right")
-        ttk.Label(head, text="进制", style="Muted.TLabel").pack(side="right", padx=(0, 6))
+        """「格式」下拉：同一个 16 位值怎么显示、就地编辑时按什么解析。
+
+        以前叫「进制」—— 但「有符号」根本不是进制（进制只有十/十六/二），
+        它改的是符号解释；而且「十进制」和「有符号」都是十进制显示，
+        真正的区别是无符号/有符号。按主站页的叫法统一成「格式」，
+        选项改成「无符号」让两者的对立一目了然。
+        """
+        # 与主站页同一套切换构件：卡片里从右往左依次是「格式」标签、下拉、
+        # 视图切换按钮；都按 side="left" 排，顺序即视觉顺序
+        box = ttk.Frame(head, style="Inner.TFrame")
+        box.pack(side="right")
+        ttk.Label(box, text="格式", style="Muted.TLabel").pack(side="left", padx=(0, 6))
+        self.slave_fmt_box = ttk.Combobox(box, values=("无符号", "有符号", FMT_HEX, FMT_BIN),
+                                          state="readonly", width=8)
+        self.slave_fmt_box.set("无符号")
+        self.slave_fmt_box.pack(side="left", padx=(0, 10))
+        self.slave_view_btn = self._build_view_button(box, self._toggle_slave_view)
+        self._sync_slave_view_switch()
         self.slave_fmt_box.bind("<<ComboboxSelected>>",
                                 lambda e: self._refresh_slave_table())
 
     def _toggle_slave_view(self) -> None:
         self.set_slave_view(not self._slave_grid)
 
+    def _sync_slave_view_switch(self) -> None:
+        self._sync_view_button(self.slave_view_btn, self._slave_grid)
+
     def set_slave_view(self, grid: bool) -> None:
         self._slave_grid = grid
         if grid:
             self.slave_detail_wrap.grid_remove()
             self.slave_grid_wrap.grid(row=0, column=0, sticky="nsew")
-            self.slave_view_btn.configure(text="明细")
         else:
             self.slave_grid_wrap.grid_remove()
             self.slave_detail_wrap.grid(row=0, column=0, sticky="nsew")
-            self.slave_view_btn.configure(text="网格")
-        self._slave_sig = None            # 强制按新视图/进制重建
+        self._sync_slave_view_switch()
+        self._slave_sig = None            # 强制按新视图/格式重建
         self._refresh_slave_table()
 
     def _do_write_async(self) -> None:
@@ -2695,11 +3630,11 @@ class ModbusApp:
             return
         fc = self._current_fc()
         if fc not in (5, 6, 15, 16, 22):
-            self._notify("当前功能码是读操作，请点“读取”", error=True)
+            self._notify("当前功能码是读操作，写入请先切换到写功能码", error=True)
             return
         if fc == 22:
             # 掩码写的两个值是位掩码，固定按整数解析（支持 0x），
-            # 不跟着「数据解释」弹层里选的 float 类型漂
+            # 不跟着「数据定义」弹层里选的 float 类型漂
             values = self._parse_write_values(22, dtype="uint16")
             if values is None:
                 return
@@ -2731,8 +3666,7 @@ class ModbusApp:
                                  f"单点写放不下，请改用「写多寄存器」", error=True)
                     return
         try:
-            address = self._resolve_address(
-                self._int_field(self.addr_var, "起始地址", 0, 65535), fc)
+            address = self._address_field(fc)
         except (ValueError, AddressError) as exc:
             self._notify(f"参数有误：{exc}", error=True)
             return
@@ -2741,20 +3675,35 @@ class ModbusApp:
             self._end_request()
             if error:
                 self._notify(f"写入失败：{self._friendly_error(error)}", error=True)
-                self._mark_link(False)
+                self._mark_link(False, replied=self._replied(error))
                 self._refresh_stats()
                 return
             self._mark_link(True)
             counted, noun, bytes_ = self._write_extent(fc, len(payload))
+            # 「写的是哪一个」要明确到地址：单寄存器照旧，多寄存器给范围
+            # （状态栏）和逐地址映射（日志），记法跟表格显示保持一致
+            base = self._display_address(address, fc)
+            if counted == 1:
+                addr_text = f"地址 {base}"
+            else:
+                addr_text = f"地址 {base}~{base + counted - 1}"
             self.master_status.configure(
-                text=(f"已写入 FC{fc:02d} 地址 {address} · "
+                text=(f"已写入 FC{fc:02d} {addr_text} · "
                       f"{counted} {noun}（{bytes_} 字节）"), foreground=OK)
-            self._log(f"写入成功：地址 {address} ← {self._write_brief(values)} "
+            if fc == 22:
+                head = addr_text
+            else:
+                sp = max(1, len(payload) // max(1, len(values)))
+                head = self._register_map(base, values, sp)
+            self._log(f"写入成功：{head} ← {self._write_brief(values)} "
                       f"→ {counted} {noun} {self._hex_list(payload)}", "ok")
             self._refresh_stats()
             self._mark_written(address, 1 if fc == 22 else len(payload))
+            # 回读完成的提示会用 note 覆盖状态栏 —— 地址范围必须带进去，
+            # 不然「写的是哪一个」又在最后一行丢了
             self._readback(fc, address, 1 if fc == 22 else len(payload),
-                           f"已写入 {counted} {noun}（{bytes_} 字节）")
+                           f"已写入 FC{fc:02d} {addr_text} · "
+                           f"{counted} {noun}（{bytes_} 字节）")
 
         counted, noun, _ = self._write_extent(fc, len(payload))
         self._begin_request(f"写入中… {counted} {noun}")
@@ -2830,7 +3779,7 @@ class ModbusApp:
         def done(values, error):
             if error:
                 self._notify(f"写入已发出，但回读失败：{self._friendly_error(error)}", error=True)
-                self._mark_link(False)
+                self._mark_link(False, replied=self._replied(error))
                 self._refresh_stats()
                 return
             self._mark_link(True)
@@ -2851,22 +3800,131 @@ class ModbusApp:
 
     def _toggle_poll(self) -> None:
         if self._polling:
-            self._stop_poll()
+            self._stop_poll(manual=True)
             return
+        self._start_poll()
+
+    def _start_poll(self, auto: bool = False) -> bool:
+        """开轮询。auto=True 表示连接成功后自动触发，只在日志上区分来源。
+
+        手动和自动走同一条路：自动触发的参数不合法时不能静默什么都不做，
+        否则用户看到的就是「连上了但没在轮询」，还以为功能坏了。
+        """
         client = self._require_client()
         if client is None:
-            return
-        fc = FC_OPTIONS[self.fc_box.current()][1]
+            return False
+        fc = self._current_fc()
         if fc not in (1, 2, 3, 4):
-            self._notify("轮询只能用于读操作", error=True)
-            return
+            if auto:
+                # 自动触发不弹错误打扰刚连上的那一下，但要在日志里说清为什么没动
+                self._log(f"当前功能码 FC{fc:02d} 是写操作，已跳过自动轮询")
+            else:
+                self._notify("轮询只能用于读操作", error=True)
+            return False
         self._polling = True
         self._poll_failures = 0
         self.poll_btn.configure(text="停止轮询")
-        self._log("开始轮询")
+        if auto:
+            self._log(f"已连接，自动开始轮询（间隔 {self.interval_var.get().strip()} ms）")
+        else:
+            self._log("开始轮询")
         self._poll_tick()
+        return True
 
-    def _stop_poll(self) -> None:
+    def _probe_device_then_poll(self) -> None:
+        """连上先静默问一句「对面是谁」，再进入轮询。
+
+        FC 0x2B 是协议里的可选项，廉价变频器/温控表多半回异常码甚至不应答，
+        所以这一帧压到短超时、不重试、失败完全静默：成功就白捡一个型号写进
+        链路胶囊，失败则当作没问过 —— 用户不该因为设备不支持一个可选功能，
+        就怀疑自己的连接出了问题。
+
+        排在轮询之前是有意的：轮询一开就长期占住请求闸门，这一帧再想插进去
+        只能干等；而它本身就是「认识对面」的第一步，先认识再看数据，也正好
+        是现场联调的顺序。
+        """
+        client = self.client
+        if client is None or self._request_active:
+            self._autostart_poll()
+            return
+        request_id = self._begin_request("正在确认设备…")
+        if request_id is None:
+            self._autostart_poll()
+            return
+
+        def done(result, error):
+            self._end_request(request_id)
+            if not error:
+                self._apply_device_id(result)
+            self._autostart_poll()
+
+        self._async(lambda: client.probe_device_id(),
+                    self._request_callback(request_id, done))
+
+    def _apply_device_id(self, result: dict) -> None:
+        """把 FC2B 的对象表落到界面：胶囊显示短名，日志记全表。"""
+        items = self._device_items(result)
+        if not items:
+            return
+        # 胶囊只有一行的位置，塞全表会把它撑成两行；型号名够认出对面是谁了，
+        # 厂商、版本的完整信息留给日志
+        self._device_note = self._device_summary(result)
+        self._render_link()
+        self._log(f"设备标识（FC2B）：{items}", "ok")
+
+    @staticmethod
+    def _device_items(result: dict) -> str:
+        """「厂商名=xx · 产品代码=yy」这样一行，日志与状态栏共用。"""
+        return " · ".join(
+            f"{DEVICE_ID_OBJECTS.get(oid, f'对象 {oid}')}={value}"
+            for oid, value in sorted(result.items()))
+
+    @staticmethod
+    def _device_summary(result: dict) -> str:
+        """从设备标识里挑一个够短、够认得出的名字给链路胶囊。
+
+        优先型号名（0x05）与产品名称（0x04）—— 同一家厂商的一排设备，
+        认出「ModNova」远不如认出「ND-100」有用。两者都没有时退回
+        「厂商 + 产品代码」：只报一个 "SIM" 或只报一个厂商名，都没法
+        让人确认自己连的是哪台。
+        """
+        def get(oid: int) -> str:
+            return str(result.get(oid) or "").strip()
+
+        model = get(0x05) or get(0x04)
+        if model:
+            return model
+        vendor, code = get(0x00), get(0x01)
+        if vendor and code:
+            return f"{vendor} {code}"
+        return vendor or code
+
+    def _autostart_poll(self) -> None:
+        """连接成功后自动开轮询（不做开关，连上即进入轮询态）。
+
+        挂在连接成功回调的最后：先让「已连接 / 自环联调 / 站地址不一致」
+        这些一次性提示落地，再开轮询 —— 否则轮询的读数会立刻把状态栏
+        占住，刚连上时最该看的那句话反而一闪而过。
+        想停就在工具条按「停止轮询」，想手动补一次数据按 F5。
+        """
+        if self.client is None or self._polling:
+            return
+        if self._request_active:
+            # 连上瞬间还有别的请求在跑（例如刚点过「写入」）：等它结束再来，
+            # 不能抢同一个请求闸门，否则 _begin_request 会把这次轮询吞掉
+            self.root.after(120, self._autostart_poll)
+            return
+        self._start_poll(auto=True)
+
+    def _stop_poll(self, manual: bool = False) -> None:
+        """停轮询。manual=True 表示这是用户按的（按钮 / Esc）。
+
+        区分这两种来源是因为「切到写功能码导致的停」和「用户不想轮询了」
+        是两回事：前者切回读码要能自己接上，后者必须一直停着 —— 用户明确
+        说了不要，再自动重启就是在跟人抢方向盘。
+        """
+        if manual:
+            self._poll_resume_on_read = False
         if not self._polling:
             return
         self._polling = False
@@ -2878,41 +3936,53 @@ class ModbusApp:
             return
         fc = self._current_fc()
         try:
-            address = self._resolve_address(
-                self._int_field(self.addr_var, "起始地址", 0, 65535), fc)
+            address = self._address_field(fc)
             # 上限按功能码走：FC03 是 125，FC01 才是 2000。
             # 原来一律按 2000 放行，填 200 个寄存器开始轮询后每 500ms
             # 报一次同样的「数量必须在 1~125 之间」，还得手动按 Esc 才停。
             count = self._int_field(self.count_var, "数量", 1, read_limit(fc) or 125)
             interval = max(50, self._int_field(self.interval_var, "轮询间隔", 50, 60000))
-        except (ValueError, AddressError):
+        except (ValueError, AddressError) as exc:
             self._stop_poll()
+            # 静默停会让人以为轮询自己坏了 —— 参数哪里不对，说清楚
+            self.master_status.configure(text=f"轮询已停止：{exc}", foreground=ERR)
             return
+
+        # 失败提示要带「读的是哪一段」。只说「地址或数量超出从站范围」，用户
+        # 还得自己回想地址框里那串是 16384 还是 4000 —— 而 0x4000 恰好等于
+        # 16384，这两个数最容易混。地址按当前记法显示，与框里、表头对得上。
+        target = f"地址 {self._addr_text(address, fc)} 起 {count} 点"
 
         def done(values, error):
             if error:
                 self._poll_failures += 1
-                self.master_status.configure(
-                    text=f"轮询失败：{self._friendly_error(error)}", foreground=ERR)
-                self._mark_link(False)
+                reason = self._friendly_error(error)
+                # 从站回的异常码单列出来：那是「设备说不行」，和本机校验失败
+                # 的排查方向完全不同；不写码，就只剩一句含糊的「失败」
+                code = getattr(error, "code", None)
+                why = f"从站异常 {code:02X} · {reason}" if code is not None else reason
+                self._mark_link(False, replied=self._replied(error))
                 if self._poll_failures >= 5:
                     # 连续 5 次同样的失败（多为参数错误）再轮下去只是刷屏，
                     # 停掉并把原因留在状态栏，比让用户自己按 Esc 更明确。
                     self._stop_poll()
                     self.master_status.configure(
                         text=f"轮询已自动停止（连续 {self._poll_failures} 次失败）："
-                             f"{self._friendly_error(error)}", foreground=ERR)
+                             f"{target} · {why}", foreground=ERR)
                     return
+                self.master_status.configure(
+                    text=f"轮询失败 {self._poll_failures}/5 · {target} · {why}",
+                    foreground=ERR)
             else:
                 self._poll_failures = 0
                 self._mark_link(True)
                 if not self._editing:      # 正在就地编辑时别重画，否则输入框会被顶走
                     self._render_values(values, address)
-                self._csv_record(fc, address, values)
                 latency = self.client.last_latency_ms if self.client else None
                 extra = f" · {latency:.1f} ms" if latency is not None else ""
+                shown = f"地址 {self._addr_text(address, fc)} 起 {len(values)} 点"
                 self.master_status.configure(
-                    text=f"轮询中 · 地址 {address} 共 {len(values)} 点{extra}", foreground=MUTED)
+                    text=f"轮询中 · {shown}{extra}", foreground=MUTED)
             self._refresh_stats()
             if self._polling:
                 self.root.after(interval, self._poll_tick)
@@ -2921,26 +3991,63 @@ class ModbusApp:
 
     # ------------------------------------------------------------ 从站逻辑
 
+    def _set_slave_param_state(self, running: bool) -> None:
+        """从站运行中锁住启动参数（下拉转 disabled，其余转 normal/readonly）。
+
+        模式/端口/站地址/数据区长度只在启动那一刻被读取，运行中改了也不
+        生效 —— 与其让人改完以为生效了，不如直接锁住。演示数据开关和
+        故障注入是运行时特性，不在锁的范围内。
+        """
+        for box in (self.slave_mode_box, self.slave_baud, self.slave_databits,
+                    self.slave_parity, self.slave_stopbits):
+            box.configure(state="disabled" if running else "readonly")
+        for widget in (self.slave_host, self.slave_port, self.slave_serial,
+                       self.slave_unit, self.slave_size):
+            widget.configure(state="disabled" if running else "normal")
+
     def _toggle_server(self) -> None:
         if self.server is not None and self.server.running:
+            # 停止同样是异步的：完成前锁住按钮和 _busy。不然旧 socket 还没
+            # 关完就按同一端口再启动，会撞出误导性的「端口被占——可能另一个
+            # 实例占着」，而占着的是你自己刚点停止的那个
+            self._busy = True
             server, self.server = self.server, None
-            self._async(server.stop, lambda r, e: self._log("从站已停止"))
-            self.slave_btn.configure(text="启动从站", style="Accent.TButton")
-            self.slave_stat.configure(text="已停止")
+            self.slave_btn.configure(state="disabled")
+            self.slave_stat.configure(text="正在停止…")
             self.tabs.set_badge(1, False)
+            self._sync_crc_field()
+
+            def stopped(_result, _error):
+                self._busy = False
+                self._set_slave_param_state(False)
+                self.slave_btn.configure(state="normal", text="启动从站",
+                                         style="Accent.TButton")
+                self.slave_stat.configure(text="已停止", foreground=MUTED)
+                # 「从站已停止」由 server.stop 自己记（TCP/RTU 文案各自贴切），
+                # 这里不重复；只有停止本身出错才需要补一条
+                if _error is not None:
+                    self._log(f"停止从站时出错：{_error}", "err")
+
+            self._async(server.stop, stopped)
             return
 
         if self._busy:
             return
         try:
             unit = self._int_field(self.slave_unit, "从站站号", 1, 247)
-            size = self._int_field(self.slave_size, "寄存器数量", 1, 65536)
+            size = self._int_field(self.slave_size, "数据区长度", 1, 65536)
             store = DataStore(size=size)
             if self.slave_mode.get() in ("tcp", "rtutcp"):
+                # 清空输入框时只听本机，别把寄存器区静默暴露到网段
+                host = self.slave_host.get().strip() or "127.0.0.1"
+                blocked = self._probe_listen_host(host)
+                if blocked:
+                    # 点击瞬间就拦下并说清「本机有哪些地址可填」，
+                    # 不让用户等一轮异步失败后对着一行小字猜
+                    raise ValueError(blocked)
                 server_cls = TcpServer if self.slave_mode.get() == "tcp" else RtuOverTcpServer
                 server = server_cls(
-                    # 清空输入框时只听本机，别把寄存器区静默暴露到网段
-                    host=self.slave_host.get().strip() or "127.0.0.1",
+                    host=host,
                     port=self._int_field(self.slave_port, "监听端口", 0, 65535),
                     store=store, unit=unit, on_log=self._log,
                 )
@@ -2956,7 +4063,8 @@ class ModbusApp:
                     store=store, unit=unit, on_log=self._log,
                 )
         except (ValueError, RuntimeError, TransportError) as exc:
-            self.slave_stat.configure(text=f"启动失败：{exc}")
+            # 启动失败用错误色强调：参数卡里一行灰字容易被当成「点了没反应」
+            self.slave_stat.configure(text=f"启动失败：{exc}", foreground=ERR)
             self._log(f"无法启动从站：{exc}", "err")
             return
 
@@ -2967,24 +4075,109 @@ class ModbusApp:
             self._busy = False
             self.slave_btn.configure(state="normal")
             if error:
+                reason = self._explain_server_error(error)
                 self.slave_btn.configure(text="启动从站")
-                self.slave_stat.configure(text=f"启动失败：{error}")
-                self._log(f"从站启动失败：{error}", "err")
+                self.slave_stat.configure(text=f"启动失败：{reason}", foreground=ERR)
+                self._log(f"从站启动失败：{reason}", "err")
                 return
             self.server = server
             self.slave_btn.configure(text="停止从站", style="Danger.TButton")
-            self.slave_stat.configure(text=f"运行中 · 端口 {server.port} · 站 {unit}")
+            self._set_slave_param_state(True)   # 启动参数锁住：改了不生效就别让改
+            self.slave_stat.configure(text=f"运行中 · 端口 {server.port} · 站 {unit}",
+                                      foreground=MUTED)
             self._log(f"从站已启动（{server.port}）", "ok")
             self.tabs.set_badge(1, True)      # 在「从站」上点一颗绿灯，主站页也看得见它在跑
             self._clear_faults()              # 新从站的故障注入从零开始，面板跟着归零
+            self._sync_crc_field()            # CRC 字段按实际 server 类型表态
             self._refresh_slave_table()
 
         self._async(server.start, done)
+
+    @staticmethod
+    def _explain_server_error(error: object) -> str:
+        """把从站启动失败的系统原文翻译成现场人话。
+
+        典型场景：本机还挂着另一个本工具实例（或别的程序）占着同一端口，
+        WinError 10048 的原文一大串，现场只想要「端口被占了，换一个或停掉它」。
+        """
+        text = str(error)
+        if "10048" in text or "Only one usage" in text or "只允许使用一次" in text:
+            return ("监听端口已被占用 —— 可能另一个本工具实例的从站或别的程序"
+                    "正占着它；换个端口，或先停掉占用者")
+        if "10049" in text:
+            return "监听地址不可用 —— 本机上没有这个地址，检查「监听地址」的填法"
+        return text
+
+    @staticmethod
+    def _local_ips() -> list[str]:
+        """给报错文案列本机可用地址；枚举不到就只剩 127.0.0.1。"""
+        ips = {"127.0.0.1"}
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None,
+                                           socket.AF_INET):
+                ips.add(info[4][0])
+        except OSError:
+            pass
+        return sorted(ips)
+
+    @staticmethod
+    def _probe_listen_host(host: str) -> str | None:
+        """启动前同步探测监听地址是否可绑定；不可用就返回一句能照做的话。
+
+        背景：用户把现场设备的 IP（如 192.168.13.10）填进监听地址，以前
+        要等一轮异步 bind 失败，才在状态栏看到一行小字 —— 看起来就像
+        「点了没反应」。这里在点击瞬间用「绑 0 号端口」探测（不占端口、
+        不碰真实端口，端口冲突仍由异步启动按 10048 报告）。
+
+        只对 IP 字面量探测：主机名要走 DNS，可能阻塞 UI 线程数秒，
+        那种情况维持原异步路径，失败原文由 _explain_server_error 翻译。
+        """
+        try:
+            version = ipaddress.ip_address(host).version
+        except ValueError:
+            return None
+        family = socket.AF_INET6 if version == 6 else socket.AF_INET
+        try:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+        except OSError:
+            return None
+        try:
+            sock.bind((host, 0))
+            return None
+        except OSError:
+            ips = ModbusApp._local_ips()
+            return (f"监听地址 {host} 不是本机的 IP —— 本机可用："
+                    f"{'、'.join(ips)}；要给局域网访问请填 0.0.0.0")
+        finally:
+            sock.close()
 
     # -- 故障注入 ----------------------------------------------------------
 
     _FAULT_FIELDS = ("fault_drop", "fault_delay", "fault_exc",
                      "fault_exc_code", "fault_trunc", "fault_crc")
+
+    def _crc_capable(self) -> bool:
+        """坏 CRC 只对帧尾带 CRC 的从站形态有意义：串口 RTU、RTU over TCP 透传。
+
+        Modbus TCP 帧没有 CRC 校验域，注入了也无处安放。运行中以实际
+        server 类型为准（运行中切模式下拉不改已启动的从站）；未启动时
+        按当前模式预示将要启动的形态。
+        """
+        if self.server is not None:
+            # RtuOverTcpServer 继承 TcpServer 但帧尾带 CRC，不能 isinstance 一刀切
+            return type(self.server) is not TcpServer
+        return self.slave_mode.get() in ("rtutcp", "rtu")
+
+    def _sync_crc_field(self) -> None:
+        """坏CRC 字段的可用性 = 帧里到底有没有 CRC。
+
+        替代原来那行常驻说明文字：TCP 模式字段禁用、标题变灰（不可用）；
+        RTU 系模式恢复正常、标题回到正文色。模式切换、从站启停都会走到这里。
+        """
+        capable = self._crc_capable()
+        self.fault_crc.state(["!disabled"] if capable else ["disabled"])
+        self._fault_labels["坏CRC %"].configure(
+            foreground=TEXT if capable else MUTED)
 
     def _fault_params(self) -> dict | None:
         """把面板上的输入换成 FaultConfig 字典；出错返回 None 并提示。"""
@@ -3004,6 +4197,10 @@ class ModbusApp:
         if not 0 <= code <= 255:
             self.fault_stat.configure(text="异常码必须在 0~255 之间", foreground=ERR)
             return None
+        # 字段在 TCP 模式已禁用变灰，但 RTU 模式填的值还留在框里 —— 兜一层，
+        # 别让残留值被 Apply 进一个帧里根本没有 CRC 的从站
+        if not self._crc_capable():
+            params["bad_crc_rate"] = 0.0
         return params
 
     def _apply_faults(self) -> None:
@@ -3033,7 +4230,7 @@ class ModbusApp:
             return
         parts = []
         if faults.drop_rate:
-            parts.append(f"丢包 {faults.drop_rate * 100:g}%")
+            parts.append(f"不响应 {faults.drop_rate * 100:g}%")
         if faults.delay:
             parts.append(f"延迟 {faults.delay * 1000:g}ms")
         if faults.exception_rate:
@@ -3064,7 +4261,7 @@ class ModbusApp:
         # 批量读：一格一次 get() 就是 500 次加锁 + 500 次信号扫描，每 800ms 一轮
         values = store.read_area(area, start, count)
         is_bit = area in BIT_AREAS
-        # 进制只在网格视图有意义；位区 ●/○ 已经是最佳显示，也不参与
+        # 格式只在概览视图有意义；位区 ●/○ 已经是最佳显示，也不参与
         fmt = "" if (is_bit or not self._slave_grid) else self.slave_fmt_box.get()
         self.slave_fmt_box.configure(
             state="readonly" if (self._slave_grid and not is_bit) else "disabled")
@@ -3115,10 +4312,11 @@ class ModbusApp:
         if is_bit:
             per, width, anchor = 10, 40, "center"
             cells = ["●" if v else "○" for v in values]
-        elif fmt == "HEX":
-            per, width, anchor = 10, 66, "e"
-            cells = [hex_of([v], prefix=False) for v in values]
-        elif fmt == "BIN":
+        elif fmt == FMT_HEX:
+            per, width, anchor = 10, 82, "e"
+            # 与主站一致带 0x 前缀；就地编辑时 parse_int 也认这个前缀
+            cells = [hex_of([v]) for v in values]
+        elif fmt == FMT_BIN:
             per, width, anchor = 4, 128, "w"
             cells = [bin_of([v]) for v in values]
         elif fmt == "有符号":
@@ -3146,6 +4344,13 @@ class ModbusApp:
         if self.server is None:
             self.root.after(800, self._tick_slave_refresh)
             return
+        if not self.server.running:
+            # server 侧线程循环结束时会自行清掉 _running（server.py 的 finally），
+            # 但没人点「停止」—— 界面若还挂着「运行中」和绿灯，用户会以为
+            # 它仍在应答。这里当看门狗：发现灯灭了就按手动停止的口径复位。
+            self._on_server_died()
+            self.root.after(800, self._tick_slave_refresh)
+            return
         if self.slave_grid.winfo_ismapped() or self.slave_tree.winfo_ismapped():
             try:
                 self._refresh_slave_table()
@@ -3154,6 +4359,22 @@ class ModbusApp:
                 # 与 applog「崩溃必须留痕」的项目纪律相悖 —— 至少留一行日志。
                 self._log(f"从站数据刷新失败：{exc}", "err")
         self.root.after(800, self._tick_slave_refresh)
+
+    def _on_server_died(self) -> None:
+        """从站没被点停止、循环自己结束了：监听挂掉、串口被拔、线程异常退出。
+
+        按手动停止（_toggle_server 停止分支）的同一套口径复位界面，
+        状态栏用错误色并写明「异常退出」，跟主动停止区分开。
+        """
+        server, self.server = self.server, None
+        self._set_slave_param_state(False)
+        self.slave_btn.configure(state="normal", text="启动从站",
+                                 style="Accent.TButton")
+        self.slave_stat.configure(text="已停止（异常退出）", foreground=ERR)
+        self.tabs.set_badge(1, False)
+        self._sync_crc_field()
+        self._log(f"从站异常退出（{type(server).__name__} 循环已结束），界面已复位",
+                  "err")
 
     def _tick_demo(self) -> None:
         if self.demo_var.get() and self.server is not None and self.server.running:
@@ -3171,6 +4392,24 @@ class ModbusApp:
                 self._log(f"演示数据写入失败：{exc}", "err")
         self.root.after(250, self._tick_demo)
 
+    def _slave_hover(self, event) -> None:
+        """悬停在可编辑格子上光标变手型。
+
+        「双击数值可直接改」这句话撤掉之后，可编辑性改由两个状态信号表达：
+        手型光标（悬停即知）+ 编辑反馈行（改完即现）。可编辑范围与双击
+        处理一致：明细只有「值」列，概览除行头地址列外全是数据格。
+        """
+        tree = event.widget
+        if tree.identify_region(event.x, event.y) != "cell":
+            tree.configure(cursor="")
+            return
+        column = tree.identify_column(event.x)
+        editable = (column == "#2") if tree is self.slave_tree else (column != "#1")
+        tree.configure(cursor="hand2" if editable else "")
+
+    def _slave_hover_leave(self, event) -> None:
+        event.widget.configure(cursor="")
+
     def _begin_cell_edit(self, event) -> None:
         tree = self.slave_tree
         if tree.identify_region(event.x, event.y) != "cell":
@@ -3186,7 +4425,7 @@ class ModbusApp:
                                 int(row_id), tree.set(row_id, "dec"), "dec")
 
     def _begin_grid_edit(self, event) -> None:
-        """网格视图的双击编辑：列偏移 + 行头起始地址 = 寄存器地址。"""
+        """概览视图的双击编辑：列偏移 + 行头起始地址 = 寄存器地址。"""
         tree = self.slave_grid
         if tree.identify_region(event.x, event.y) != "cell" or self.server is None:
             return
@@ -3213,7 +4452,7 @@ class ModbusApp:
         else:
             initial = tree.set(row_id, f"c{col}")
             shown = self.slave_fmt_box.get()
-            fmt = "dec" if shown in ("十进制", "有符号") else shown
+            fmt = "dec" if shown in ("无符号", "有符号") else shown
         self._spawn_cell_editor(tree, row_id, column, bbox, index, initial, fmt)
 
     def _spawn_cell_editor(self, tree, row_id, column, bbox, index: int,
@@ -3230,10 +4469,14 @@ class ModbusApp:
         self._editor = editor
 
         def commit(_event=None):
-            if self._editor is None:
+            # 只提交「触发事件的这个编辑器」的内容。以前读 self._editor——
+            # 正常操作下两者总是一个人（回车/失焦时编辑器立刻销毁），但
+            # 失焦事件是异步投递的，若销毁前新编辑器已经顶上，旧编辑器的
+            # 失焦提交就会把新编辑器里的内容写到旧地址上（合成事件下实测复现）。
+            if self._editor is not editor:
                 return
-            text = self._editor.get().strip()
-            self._editor.destroy()
+            text = editor.get().strip()
+            editor.destroy()
             self._editor = None
             self._editing = False
             if not text:
@@ -3244,7 +4487,14 @@ class ModbusApp:
                 self._apply_cell_edit(index, text, fmt)
 
         editor.bind("<Return>", commit)
-        editor.bind("<Escape>", lambda e: self._cancel_edit())
+
+        def escape(_event=None):
+            self._cancel_edit()
+            # return "break"：编辑器的 Esc 只取消编辑，别把事件再传给全局
+            # <Escape> 绑定 —— 那里挂着「停止轮询」，按一下 Esc 做两件事太惊悚
+            return "break"
+
+        editor.bind("<Escape>", escape)
         # 从站是本地内存，失焦提交没什么代价；主站是往真设备写，
         # 手一抖点到别处就发一帧写命令太危险 —— 必须按回车才写。
         editor.bind("<FocusOut>", commit if commit_on_blur else (lambda e: self._cancel_edit()))
@@ -3268,9 +4518,9 @@ class ModbusApp:
         try:
             if area in BIT_AREAS:
                 value = text.lower() in ("1", "on", "true", "yes", "●")
-            elif fmt == "HEX":
-                value = int(text, 16)
-            elif fmt == "BIN":
+            elif fmt == FMT_HEX:
+                value = int(text, 16)          # int(..., 16) 自带 0x 前缀容错
+            elif fmt == FMT_BIN:
                 value = int(text, 2)
             else:
                 value = _parse_int(text)
@@ -3297,6 +4547,14 @@ class ModbusApp:
         if self.server is None:
             self.slave_stat.configure(text="请先启动从站")
             return
+        # 一键抹掉的不只是几个数 —— 联调时手工构造的整片模拟数据都在这块
+        # 区里，误点一下全没了且无法撤销。清空前问一句。
+        if not messagebox.askokcancel(
+                "清空从站数据",
+                "四个数据区将全部归零，手工填的模拟数据无法恢复。",
+                parent=self.root):
+            self._log("已取消清零")
+            return
         self.server.store.clear()
         self._refresh_slave_table()
         self._log("从站数据已清零")
@@ -3305,7 +4563,6 @@ class ModbusApp:
 
     def _on_close(self) -> None:
         self._polling = False
-        self._csv_close_quiet()          # 记录中的 CSV 必须关掉，Windows 上留着句柄删不掉
         if self.server is not None:
             try:
                 self.server.stop()

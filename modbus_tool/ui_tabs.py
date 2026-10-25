@@ -67,6 +67,8 @@ class SegmentedTabs(tk.Canvas):
         self._focused = False
         self._anim_id: str | None = None
         self._badges: dict[int, bool] = {i: False for i in self._badge_slots}
+        self._dot_cache: dict[int, tk.PhotoImage] = {}
+        self._dot_d = max(6, round(6 * self._s))
 
         self._layout_segments()
         self._draw()
@@ -163,7 +165,8 @@ class SegmentedTabs(tk.Canvas):
             for i, label in enumerate(self._labels)
         ]
         self._dots = {
-            i: self.create_oval(0, 0, 0, 0, fill=OK, outline="", state="hidden")
+            i: self.create_image(0, 0, anchor="center", state="hidden",
+                                 image=self._dot_image())
             for i in self._badge_slots
         }
         self._place_pill(self._seg_x[0], self._seg_w[0])
@@ -304,6 +307,17 @@ class SegmentedTabs(tk.Canvas):
 
     # ---------------------------------------------------------------- 状态灯
 
+    def _dot_image(self):
+        """状态灯小圆点。用 4× 超采样图而不是 create_oval ——
+        Tk 的椭圆不做抗锯齿，6px 的圆点放大就是一个方块。"""
+        key = self._dot_d
+        img = self._dot_cache.get(key)
+        if img is None:
+            img = photo(self, png_rgba(key, key, render_rounded(
+                key, key, key // 2 + 1, OK, base=CARD)))
+            self._dot_cache[key] = img
+        return img
+
     def set_badge(self, index: int, active: bool) -> None:
         """在指定段右侧点亮一个小圆点（用于「从站正在运行」这类后台状态）。"""
         if index not in self._dots:
@@ -314,11 +328,10 @@ class SegmentedTabs(tk.Canvas):
             self.itemconfigure(item, state="hidden")
             return
         s = self._s
-        r = 3 * s
         # 落在段内右侧的留白里，不进文字区，所以段落宽度和文字居中都不用为它让位
         cx = self._seg_x[index] + self._seg_w[index] - round(10 * s)
         cy = self._height / 2
-        self.coords(item, cx - r, cy - r, cx + r, cy + r)
+        self.coords(item, cx, cy)
         self.itemconfigure(item, state="normal")
 
     def badge(self, index: int) -> bool:

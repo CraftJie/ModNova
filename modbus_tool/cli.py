@@ -251,7 +251,7 @@ def cmd_serve(args) -> int:
         # 以前这里靠 DataStore.set 抛 ModbusError，而 main() 只兜 ValueError，
         # 用户看到的是裸 traceback。
         raise SystemExit(
-            f"--init 提供了 {len(init_values)} 个初值，超出区间长度 --size {args.size}")
+            f"--init 提供了 {len(init_values)} 个初值，超出数据区长度 --size {args.size}")
     for index, value in enumerate(init_values):
         store.set("holding_registers", index, value)
 

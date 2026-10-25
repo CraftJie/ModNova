@@ -28,6 +28,7 @@ DEFAULT_CONFIG: dict = {
         "port": 502,
         "port_name": "",
         "baud": 9600,
+        "databits": 8,
         "parity": "N",
         "stopbits": 1,
         "unit": 1,
@@ -52,6 +53,10 @@ DEFAULT_CONFIG: dict = {
 
 
 def default_path() -> Path:
+    # 环境变量优先：回归测试和多开实例各用各的配置，谁也别动用户目录里的那份
+    override = os.environ.get("MODNOVA_CONFIG")
+    if override:
+        return Path(override)
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA") or Path.home())
     else:

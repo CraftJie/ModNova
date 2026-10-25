@@ -144,7 +144,8 @@ class TestRtuOverTcpCore(unittest.TestCase):
     def test_connect_label(self):
         self.assertTrue(self.app.link_info["connected"])
         self.assertEqual(self.app.link_info["mode"], "rtutcp")
-        self.assertIn("RTU/TCP", self.app.link_info["label"])
+        # transport 的标签已统一成「RTU over TCP」（与界面下拉文案一致）
+        self.assertIn("RTU over TCP", self.app.link_info["label"])
 
     def test_typed_read(self):
         self.app.slave_set("holding_registers", 0, 0x435C)

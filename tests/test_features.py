@@ -25,9 +25,11 @@ from modbus_tool.pdu import (
     build_device_id_response,
     parse_device_id_response,
 )
+from modbus_tool.client import ModbusClient
 from modbus_tool.server import FaultConfig, ModbusServer
 from modbus_tool.view import Field, decode_fields, parse_fields, total_span, validate_fields
 from modbus_tool.core import ModbusCore
+from modbus_tool.transport import Transport
 
 
 class TestFieldView(unittest.TestCase):
@@ -366,6 +368,47 @@ class TestWebFeatures(unittest.TestCase):
         names = {item["name"]: item["value"] for item in info["items"]}
         self.assertIn("厂商名", names)
         self.assertTrue(names["厂商名"])
+
+    def test_probe_device_id_is_silent(self):
+        """探测失败不能留下任何痕迹：计数、日志、超时、重试次数都要复原。
+
+        0x2B 是协议里的可选项，多数廉价设备不支持。若探测走常规超时并计入
+        request/error，用户每次连接都会看到凭空的失败统计，还得等满一整个
+        超时周期才看到第一屏数据。
+        """
+        class _Dead(Transport):
+            def __init__(self):
+                super().__init__(timeout=3.0)
+                self._conn = False
+                self.logs = []
+
+            @property
+            def connected(self):
+                return self._conn
+
+            def open(self):
+                self._conn = True
+
+            def close(self):
+                self._conn = False
+
+            def send(self, unit, pdu):
+                pass
+
+            def recv(self):
+                raise TimeoutError("no answer")
+
+        link = _Dead()
+        client = ModbusClient(link, unit=1, retries=2, on_log=link.logs.append)
+        started = time.perf_counter()
+        with self.assertRaises(TimeoutError):
+            client.probe_device_id(timeout=0.2)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(link.timeout, 3.0)       # 超时设回去，后续读不受影响
+        self.assertEqual(client.retries, 2)       # 重试次数设回去
+        self.assertEqual((client.request_count, client.error_count), (0, 0))
+        self.assertEqual(link.logs, [])           # 探测失败不进消息日志
+        self.assertLess(elapsed, 1.0)             # 用的是短超时，不是 3 s
 
 
 if __name__ == "__main__":

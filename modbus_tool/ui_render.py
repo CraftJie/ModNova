@@ -46,19 +46,32 @@ def mix(a: str, b: str, t: float) -> str:
 
 
 def rounded_span(y: float, x1, y1, x2, y2, r):
-    """某一条水平线与圆角矩形的交集区间；落在上下圆角里就按圆方程缩进。"""
+    """某一条水平线与圆角矩形的交集区间；落在上下圆角里就按圆方程缩进。
+
+    r 允许传四个角各自的半径 (左上, 右上, 右下, 左下)：分裂按钮（主区 +
+    窄的 ▾ 区）要把两块拼成一个胶囊，右侧那块只在右上/右下带圆角，
+    左侧那块只在左上/左下带圆角 —— 四个角必须能分别指定。
+    """
     if y < y1 or y >= y2:
         return None
-    if r <= 0:
-        return x1, x2
-    if y < y1 + r:
-        dy = (y1 + r) - y
-    elif y > y2 - r:
-        dy = y - (y2 - r)
+    if isinstance(r, (int, float)):
+        r_tl = r_tr = r_br = r_bl = r
     else:
-        return x1, x2
-    dx = math.sqrt(max(0.0, r * r - dy * dy))
-    return x1 + r - dx, x2 - r + dx
+        r_tl, r_tr, r_br, r_bl = r
+    left, right = x1, x2
+    if r_tl > 0 and y < y1 + r_tl:
+        dy = (y1 + r_tl) - y
+        left = x1 + r_tl - math.sqrt(max(0.0, r_tl * r_tl - dy * dy))
+    elif r_bl > 0 and y > y2 - r_bl:
+        dy = y - (y2 - r_bl)
+        left = x1 + r_bl - math.sqrt(max(0.0, r_bl * r_bl - dy * dy))
+    if r_tr > 0 and y < y1 + r_tr:
+        dy = (y1 + r_tr) - y
+        right = x2 - r_tr + math.sqrt(max(0.0, r_tr * r_tr - dy * dy))
+    elif r_br > 0 and y > y2 - r_br:
+        dy = y - (y2 - r_br)
+        right = x2 - r_br + math.sqrt(max(0.0, r_br * r_br - dy * dy))
+    return left, right
 
 
 def fill_rows(buf, ss: int, width: int, x1, y1, x2, y2, r, color: str) -> None:
@@ -101,21 +114,49 @@ def _downsample(buf: list[bytearray], ss: int, w: int, h: int) -> bytes:
 
 def render_rounded(w: int, h: int, r: int, fill: str, edge: str | None = None,
                     shadow: str | None = None, base: str = "#ffffff",
-                    ss: int = 4) -> bytes:
-    """渲染一张带 alpha 的圆角块，返回 RGBA 字节。"""
+                    ss: int = 4, corners: str = "1111") -> bytes:
+    """渲染一张带 alpha 的圆角块，返回 RGBA 字节。
+
+    `corners` 按 "左上 右上 右下 左下" 给四个角开关圆角，'0' 表示这一角是
+    直角 —— 分裂按钮的 ▾ 区就靠它把左边贴着主区、右边跟着胶囊圆起来。
+    """
     big_w, big_h = w * ss, h * ss
     # 透明处先铺底色（alpha=0），缩小平均时才不会把边缘拉黑
     clear = bytes((*hex_rgb(base), 0)) * big_w
     buf = [bytearray(clear) for _ in range(big_h)]
+    radii = tuple(r if flag == "1" else 0 for flag in (corners + "1111")[:4])
 
     if shadow:
-        fill_rows(buf, ss, w, 0, 1, w, h + 1, r, shadow)
+        fill_rows(buf, ss, w, 0, 1, w, h + 1, radii, shadow)
     if edge:
-        fill_rows(buf, ss, w, 0, 0, w, h, r, edge)
-        fill_rows(buf, ss, w, 1, 1, w - 1, h - 1, max(r - 1, 1), fill)
+        fill_rows(buf, ss, w, 0, 0, w, h, radii, edge)
+        fill_rows(buf, ss, w, 1, 1, w - 1, h - 1,
+                  tuple(max(v - 1, 1) if v else 0 for v in radii), fill)
     else:
-        fill_rows(buf, ss, w, 0, 0, w, h, r, fill)
+        fill_rows(buf, ss, w, 0, 0, w, h, radii, fill)
 
+    return _downsample(buf, ss, w, h)
+
+
+def render_triangle(w: int, h: int, color: str, base: str = "#ffffff",
+                    ss: int = 4) -> bytes:
+    """向下的小三角（按钮上的「可展开」指示）。
+
+    和圆角块走同一套超采样：逐行取宽度、缩小平均。4px 高的三角用
+    create_polygon 画出来就是一格格的斜边，而它偏偏落在白字旁边，
+    台阶比圆点更显眼。
+    """
+    big_w, big_h = w * ss, h * ss
+    clear = bytes((*hex_rgb(base), 0)) * big_w
+    buf = [bytearray(clear) for _ in range(big_h)]
+    rgb = hex_rgb(color)
+    for by in range(big_h):
+        py = (by + 0.5) / ss
+        half = (w / 2) * (1 - py / h)
+        start = max(0, int(round((w / 2 - half) * ss)))
+        end = min(big_w, int(round((w / 2 + half) * ss)))
+        if end > start:
+            buf[by][start * 4:end * 4] = bytes((*rgb, 255)) * (end - start)
     return _downsample(buf, ss, w, h)
 
 

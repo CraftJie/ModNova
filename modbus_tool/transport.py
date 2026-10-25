@@ -371,7 +371,7 @@ class RtuOverTcpTransport(_RtuFrameMixin, TcpTransport):
     def __init__(self, host: str = "127.0.0.1", port: int = 502,
                  timeout: float = 3.0) -> None:
         super().__init__(host, port, timeout=timeout)
-        self.label = f"RTU/TCP {host}:{port}"
+        self.label = f"RTU over TCP {host}:{port}"
 
     def _read_exact(self, size: int) -> bytes:
         # TCP 侧的字节原语叫 _recv_exact（历史命名），RTU 混入约定 _read_exact，

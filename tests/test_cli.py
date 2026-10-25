@@ -127,7 +127,8 @@ class TestServeInitLimit(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             run_main(["serve", "--tcp", "127.0.0.1:0", "--size", "4",
                       "--init", "1,2,3,4,5"])
-        self.assertIn("超出区间长度", str(ctx.exception.code))
+        # 文案已从「超出区间长度」统一为「超出数据区长度」
+        self.assertIn("超出数据区长度", str(ctx.exception.code))
 
 
 class TestParserDefaults(unittest.TestCase):

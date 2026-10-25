@@ -120,7 +120,7 @@ class ModbusServer:
     def handle_pdu(self, pdu: bytes) -> bytes | None:
         """输入一个请求 PDU，返回响应 PDU。
 
-        返回 None 表示「这次不回」—— 故障注入里的丢包模式，
+        返回 None 表示「这次不回」—— 故障注入里的不响应模式，
         真实设备掉线时就是这个表现：帧发出去了，永远等不到回应。
         """
         with self._lock:
@@ -440,7 +440,7 @@ class TcpServer:
                     continue
                 pdu_response = self.core.handle_pdu(body)
                 if pdu_response is None:
-                    continue      # 注入的丢包：这一帧不回，让主站自己超时
+                    continue      # 注入的不响应：这一帧不回，让主站自己超时
                 conn.sendall(
                     struct.pack(">HHHB", tid, 0, len(pdu_response) + 1, unit & 0xFF) + pdu_response
                 )
@@ -591,7 +591,7 @@ class RtuServer:
                     continue
                 response = self.core.handle_pdu(frame[1:-2])
                 if response is None:
-                    continue          # 注入的丢包
+                    continue          # 注入的不响应
                 try:
                     out = self.core.maybe_corrupt(append_crc(bytes([unit]) + response))
                     self._ser.write(out)
@@ -636,7 +636,7 @@ class RtuOverTcpServer(TcpServer):
                     continue
                 response = self.core.handle_pdu(frame[1:-2])
                 if response is None:
-                    continue          # 注入的丢包：这一帧不回，让主站自己超时
+                    continue          # 注入的不响应：这一帧不回，让主站自己超时
                 try:
                     out = self.core.maybe_corrupt(append_crc(bytes([unit]) + response))
                     conn.sendall(out)

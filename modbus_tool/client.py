@@ -155,6 +155,38 @@ class ModbusClient:
             raise ModbusError(response[1], "从站拒绝读设备标识")
         return parse_device_id_response(response)
 
+    def probe_device_id(self, timeout: float = 0.4) -> dict[int, str]:
+        """FC 0x2B 的一次性探测：短超时、不重试、不计数、不写日志。
+
+        0x2B 在协议里是可选项，廉价的变频器/温控表多半直接回异常码，
+        或者干脆不应答。连接成功时「对面是谁」值得顺手问一句，但用常规
+        超时去问，每次连接都要白白等满一整个超时周期 —— 那等于拿所有人
+        的连接速度去换少数设备的一个便利。这里压成单帧、单次、短超时：
+        答就答，不答就当没问过，由调用方静默处理。
+
+        失败同样不进 request/error 计数：用户没发这个请求，统计里凭空
+        多一次失败只会让人回头翻自己刚才点错了什么。
+        """
+        old_timeout = self.transport.timeout
+        old_retries = self.retries
+        old_log = self.on_log
+        before = (self.request_count, self.error_count, self.last_latency_ms)
+        self.transport.timeout = min(float(old_timeout), float(timeout))
+        self.retries = 0
+        # 探测的失败不该出现在消息日志里：那是内部行为，不是用户动作
+        self.on_log = None
+        try:
+            return self.read_device_id()
+        except Exception:
+            with self._stat_lock:
+                self.request_count, self.error_count = before[0], before[1]
+            self.last_latency_ms = before[2]
+            raise
+        finally:
+            self.transport.timeout = old_timeout
+            self.retries = old_retries
+            self.on_log = old_log
+
     # -- 读 ----------------------------------------------------------------
 
     def read(self, function: int, address: int, count: int = 1) -> list:
