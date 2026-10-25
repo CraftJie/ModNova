@@ -136,7 +136,8 @@ R_PILL = 10
 def _lum(value: str) -> float:
     h = value.lstrip("#")
     ch = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
-    f = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    def f(c):
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
     r, g, b = (f(c) for c in ch)
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
 

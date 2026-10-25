@@ -50,7 +50,7 @@ class Field:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Field":
+    def from_dict(cls, data: dict) -> Field:
         return cls(
             offset=int(data.get("offset", 0)),
             dtype=data.get("dtype", "uint16"),

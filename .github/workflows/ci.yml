@@ -24,6 +24,10 @@ jobs:
   ui-rtu:
     name: UI + RTU tests (Windows, Tk)
     runs-on: windows-latest
+    # 界面/RTU 用例的结果摘要和失败项都带中文。Windows runner 的默认控制台编码是
+    # cp1252，print 中文直接 UnicodeEncodeError —— 测试其实跑完了，死在打印上。
+    env:
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

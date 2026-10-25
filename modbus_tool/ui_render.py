@@ -20,7 +20,6 @@ import zlib
 
 from .ui_theme import ACCENT_PRESS
 
-
 # ---------------------------------------------------------------------------
 # 圆角位图渲染
 #
@@ -40,9 +39,9 @@ def mix(a: str, b: str, t: float) -> str:
     t = max(0.0, min(1.0, t))
     ra, ga, ba = hex_rgb(a)
     rb, gb, bb = hex_rgb(b)
-    return "#%02x%02x%02x" % (round(ra + (rb - ra) * t),
-                              round(ga + (gb - ga) * t),
-                              round(ba + (bb - ba) * t))
+    return (f"#{round(ra + (rb - ra) * t):02x}"
+            f"{round(ga + (gb - ga) * t):02x}"
+            f"{round(ba + (bb - ba) * t):02x}")
 
 
 def rounded_span(y: float, x1, y1, x2, y2, r):

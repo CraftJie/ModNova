@@ -75,7 +75,7 @@ class FaultConfig:
         }
 
     @classmethod
-    def from_dict(cls, data: dict | None) -> "FaultConfig":
+    def from_dict(cls, data: dict | None) -> FaultConfig:
         data = data or {}
 
         def clamp(v) -> float:

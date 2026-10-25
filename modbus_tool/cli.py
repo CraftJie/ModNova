@@ -20,8 +20,14 @@ from .datastore import DataStore
 from .parsing import parse_write_values
 from .pdu import ModbusError, ParameterError, read_limit
 from .server import RtuOverTcpServer, RtuServer, TcpServer
-from .transport import (HAS_SERIAL, RtuOverTcpTransport, RtuTransport, TcpTransport,
-                        TransportError, list_serial_ports)
+from .transport import (
+    HAS_SERIAL,
+    RtuOverTcpTransport,
+    RtuTransport,
+    TcpTransport,
+    TransportError,
+    list_serial_ports,
+)
 
 
 def _parse_endpoint(text: str, default_port: int) -> tuple[str, int]:

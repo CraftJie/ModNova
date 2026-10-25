@@ -186,7 +186,7 @@ class DataStore:
     def write_holding_registers(self, address: int, values: list[int]) -> None:
         with self._lock:
             self._check(address, len(values))
-            for offset, value in enumerate(values):
+            for value in values:
                 if not 0 <= int(value) <= 0xFFFF:
                     raise ModbusError(ExceptionCode.ILLEGAL_DATA_VALUE, f"值 {value} 超出 0~65535")
             self.holding_registers[address:address + len(values)] = [int(v) for v in values]

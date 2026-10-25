@@ -88,7 +88,7 @@ class Config:
         if not self.path.exists():
             return copy.deepcopy(DEFAULT_CONFIG)
         try:
-            with open(self.path, "r", encoding="utf-8") as handle:
+            with open(self.path, encoding="utf-8") as handle:
                 raw = json.load(handle)
             if not isinstance(raw, dict):
                 raise ValueError("配置根节点不是对象")

@@ -17,7 +17,6 @@ import base64
 import collections
 import ipaddress
 import math
-import os
 import queue
 import socket
 import time
@@ -29,13 +28,12 @@ from tkinter import filedialog, messagebox, ttk
 from .addressing import AddressError, area_of_fc, display_address, resolve_address
 from .applog import install_excepthook
 from .client import ModbusClient
-from .config import Config
 from .codec import (
     DTYPE_LABEL,
     NONPRINT,
+    DataType,
     as_signed16,
     bin_of,
-    DataType,
     decode,
     encode,
     format_value,
@@ -44,11 +42,13 @@ from .codec import (
     patch_ascii,
     span,
 )
+from .config import Config
 from .datastore import BIT_AREAS, DataStore
 from .frameparser import parse_frame
 from .parsing import normalize_number as _normalize_number
 from .parsing import parse_int as _parse_int
-from .parsing import parse_write_values, split_values as _split_values
+from .parsing import parse_write_values
+from .parsing import split_values as _split_values
 from .pdu import (
     DEVICE_ID_OBJECTS,
     ModbusError,
@@ -59,13 +59,18 @@ from .pdu import (
     write_limit,
 )
 from .server import FaultConfig, RtuOverTcpServer, RtuServer, TcpServer
-from .transport import HAS_SERIAL, RtuOverTcpTransport, RtuTransport, TcpTransport, TransportError, list_serial_ports
+from .transport import (
+    HAS_SERIAL,
+    RtuOverTcpTransport,
+    RtuTransport,
+    TcpTransport,
+    TransportError,
+    list_serial_ports,
+)
+from .ui_kit import Checkbutton as RoundCheck
+from .ui_kit import RoundedButton, StatusPill
 from .ui_render import icon_png, photo, png_rgba, render_rounded
 from .ui_tabs import SegmentedTabs
-
-# 连接浮层里标签列的固定宽度：TCP/RTU 两套字段靠它对齐
-POP_LABEL_W = 56
-from .ui_kit import Checkbutton as RoundCheck, RoundedButton, StatusPill
 from .ui_theme import (
     ACCENT,
     ACCENT_HOVER,
@@ -107,12 +112,14 @@ from .ui_theme import (
     SP_S,
     SP_XL,
     SP_XS,
-    UI_FONT,
     SUNKEN,
     TEXT,
     UI_FONT,
     WARN,
 )
+
+# 连接浮层里标签列的固定宽度：TCP/RTU 两套字段靠它对齐
+POP_LABEL_W = 56
 
 # 工具条上的一排按钮统一这个宽度（原来是 ttk 的 11 字符最小宽，
 # 换成自绘后按字数自适应，4 字按钮会比 2 字按钮窄一截）
@@ -2527,8 +2534,8 @@ class ModbusApp:
             f"读取中…（超时 {self.timeout_var.get()} s，重试 {self.retry_var.get()} 次）")
         if request_id is None:
             return
-        callback = lambda values, error: self._on_read_done(
-            values, error, address, fc, note, request_id)
+        def callback(values, error):
+            self._on_read_done(values, error, address, fc, note, request_id)
         self._async(lambda: client.read(fc, address, count),
                     self._request_callback(request_id, callback))
 
@@ -2753,7 +2760,7 @@ class ModbusApp:
         self._log(text)
 
     def _on_frame(self, direction: str, unit: int, frame: bytes) -> None:
-        self._log(f"{direction.upper()}  " + " ".join("%02X" % b for b in frame), "frame")
+        self._log(f"{direction.upper()}  " + " ".join(f"{b:02X}" for b in frame), "frame")
         # 写请求附一行解读：数量到底几个，从帧里读，不从界面参数猜
         if direction == "tx":
             note = describe_write_frame(frame)
@@ -3730,7 +3737,7 @@ class ModbusApp:
             return "[]"
         if isinstance(payload[0], bool):
             return "[" + " ".join("1" if v else "0" for v in payload) + "]"
-        return "[" + " ".join("0x%04X" % int(v) for v in payload) + "]"
+        return "[" + " ".join(f"0x{int(v):04X}" for v in payload) + "]"
 
     def _write_brief(self, values: list) -> str:
         """「220.5（f32 ABCD ×1）」—— 值加解释方式，回看日志时不用猜。"""

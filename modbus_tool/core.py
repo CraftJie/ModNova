@@ -15,9 +15,13 @@ import os
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from pathlib import Path
 
+# 版本号只有一个来源（包根的 __version__）。以前 core.meta() 写死 "1.2.1"、
+# 包根是 1.4.0、从站对 FC2B 报 "V1.3"，三处各说各话。
+from . import __version__ as _VERSION
 from .addressing import AREA_LABEL, display_address, resolve_address
 from .client import ModbusClient
 from .codec import (
@@ -37,10 +41,6 @@ from .datastore import BIT_AREAS, SIGNAL_LABEL, SIGNAL_MODES, DataStore
 from .pdu import DEVICE_ID_OBJECTS, describe_error
 from .server import FaultConfig, RtuOverTcpServer, RtuServer, TcpServer
 from .transport import HAS_SERIAL, RtuOverTcpTransport, RtuTransport, TcpTransport, list_serial_ports
-
-# 版本号只有一个来源（包根的 __version__）。以前 core.meta() 写死 "1.2.1"、
-# 包根是 1.4.0、从站对 FC2B 报 "V1.3"，三处各说各话。
-from . import __version__ as _VERSION
 from .view import Field, decode_fields, parse_fields, total_span, validate_fields
 
 # 数据类型下拉的显示名收敛到 codec.DTYPE_LABEL（导入即 re-export，
@@ -130,13 +130,13 @@ class ModbusCore:
         with self._lock:
             self._frame_seq += 1
             now = time.time()
-            stamp = time.strftime("%H:%M:%S", time.localtime(now)) + ".%03d" % int(now * 1000 % 1000)
+            stamp = time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now * 1000 % 1000):03d}"
             self.frames.append({
                 "id": self._frame_seq,
                 "t": stamp,
                 "dir": direction,
                 "unit": unit,
-                "hex": " ".join("%02X" % b for b in frame),
+                "hex": " ".join(f"{b:02X}" for b in frame),
                 "len": len(frame),
             })
 
