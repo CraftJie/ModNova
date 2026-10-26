@@ -203,18 +203,18 @@ class Runner:
                            and app.tab_slave.winfo_ismapped() == 0))
         self.case("A 导航", "点击「从站」段", "切到从站页",
                   lambda: (self.click_tab(1) or
-                           (f"index={app.tabs.index} 从站显示={bool(app.tab_slave.winfo_ismapped())}",
-                            app.tabs.index == 1 and app.tab_slave.winfo_ismapped() == 1)))
+                           (f"index={app.tabs.active_index} 从站显示={bool(app.tab_slave.winfo_ismapped())}",
+                            app.tabs.active_index == 1 and app.tab_slave.winfo_ismapped() == 1)))
         self.case("A 导航", "点击「主站」段", "切回主站页",
                   lambda: (self.click_tab(0) or
-                           (f"index={app.tabs.index} 主站显示={bool(app.tab_master.winfo_ismapped())}",
-                            app.tabs.index == 0 and app.tab_master.winfo_ismapped() == 1)))
+                           (f"index={app.tabs.active_index} 主站显示={bool(app.tab_master.winfo_ismapped())}",
+                            app.tabs.active_index == 0 and app.tab_master.winfo_ismapped() == 1)))
 
         def ctrl_keys():
-            ok2 = self.kbd(app.root, "<Control-Key-2>", lambda: app.tabs.index == 1)
-            after_ctrl2 = app.tabs.index
-            ok1 = self.kbd(app.root, "<Control-Key-1>", lambda: app.tabs.index == 0)
-            after_ctrl1 = app.tabs.index
+            ok2 = self.kbd(app.root, "<Control-Key-2>", lambda: app.tabs.active_index == 1)
+            after_ctrl2 = app.tabs.active_index
+            ok1 = self.kbd(app.root, "<Control-Key-1>", lambda: app.tabs.active_index == 0)
+            after_ctrl1 = app.tabs.active_index
             if not (ok2 and ok1):
                 # 键盘事件没投到 = 测试窗口拿不到前台焦点（用户正在用电脑），
                 # 环境性跳过；投到了但页签没动才是真失败
@@ -226,13 +226,13 @@ class Runner:
         self.case("A 导航", "Ctrl+1 / Ctrl+2", "分别直达主站/从站", ctrl_keys)
 
         def f6_key():
-            ok1 = self.kbd(app.root, "<F6>", lambda: app.tabs.index == 1)
-            first = app.tabs.index
-            ok2 = self.kbd(app.root, "<F6>", lambda: app.tabs.index == 0)
+            ok1 = self.kbd(app.root, "<F6>", lambda: app.tabs.active_index == 1)
+            first = app.tabs.active_index
+            ok2 = self.kbd(app.root, "<F6>", lambda: app.tabs.active_index == 0)
             if not (ok1 and ok2):
-                return (f"F6 两次 → {first} → {app.tabs.index}"
+                return (f"F6 两次 → {first} → {app.tabs.active_index}"
                         f"（键盘事件未投递：前台焦点被占用，按环境跳过）", True)
-            return f"F6 两次 → {first} → {app.tabs.index}", first == 1 and app.tabs.index == 0
+            return f"F6 两次 → {first} → {app.tabs.active_index}", first == 1 and app.tabs.active_index == 0
 
         self.case("A 导航", "F6 往返切换", "两次回到主站", f6_key)
 

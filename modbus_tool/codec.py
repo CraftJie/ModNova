@@ -239,7 +239,10 @@ def decode(
     dtype = DataType(dtype)
     _check_scale(float(scale))
     if dtype is DataType.ASCII:
-        return decode_ascii(registers, byteorder)
+        # ASCII 返回的是 str 列表（一个寄存器两个字符）。这个「返回什么类型
+        # 取决于 dtype」的分支用现有注解表达不了，也不值得为它写一堆 overload：
+        # 上层拿到什么就按什么格式化，这里明确标出来是同一个约定的另一半。
+        return decode_ascii(registers, byteorder)  # type: ignore[return-value]
     order = ByteOrder(byteorder)
     step = SPAN[dtype]
     fmt = _FORMAT[dtype]
@@ -284,6 +287,7 @@ def encode(
 
     out: list[int] = []
     for value in values:
+        raw_value: int | float
         if dtype in INTEGER_TYPES and scale == 1.0 and bias == 0.0:
             # 64 位整数绝不能过 float：float 尾数只有 53 位，0x4444333322221111
             # 这种值会被静默改掉低位，而且错得很隐蔽

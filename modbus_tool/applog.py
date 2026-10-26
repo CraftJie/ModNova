@@ -92,7 +92,8 @@ def install_excepthook(logger: logging.Logger | None = None, root=None,
         except Exception:
             pass
         try:                       # 原始 stderr 仍然要有一份，控制台跑的时候看得见
-            sys.__stderr__.write(text)
+            if sys.__stderr__ is not None:     # pythonw / 打包成窗口程序时它可能是 None
+                sys.__stderr__.write(text)
         except Exception:
             pass
         if on_crash is not None:

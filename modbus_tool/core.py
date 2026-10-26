@@ -18,6 +18,7 @@ from collections import deque
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from pathlib import Path
+from typing import Any
 
 # 版本号只有一个来源（包根的 __version__）。以前 core.meta() 写死 "1.2.1"、
 # 包根是 1.4.0、从站对 FC2B 报 "V1.3"，三处各说各话。
@@ -40,7 +41,14 @@ from .config import Config
 from .datastore import BIT_AREAS, SIGNAL_LABEL, SIGNAL_MODES, DataStore
 from .pdu import DEVICE_ID_OBJECTS, describe_error
 from .server import FaultConfig, RtuOverTcpServer, RtuServer, TcpServer
-from .transport import HAS_SERIAL, RtuOverTcpTransport, RtuTransport, TcpTransport, list_serial_ports
+from .transport import (
+    HAS_SERIAL,
+    RtuOverTcpTransport,
+    RtuTransport,
+    TcpTransport,
+    Transport,
+    list_serial_ports,
+)
 from .view import Field, decode_fields, parse_fields, total_span, validate_fields
 
 # 数据类型下拉的显示名收敛到 codec.DTYPE_LABEL（导入即 re-export，
@@ -96,7 +104,8 @@ class ModbusCore:
     def __init__(self, config_path=None) -> None:
         self._lock = threading.RLock()
         self.client: ModbusClient | None = None
-        self.slave = None
+        # 三种壳子（TCP / RTU / RTU over TCP）对外接口一致，类型上写明联合
+        self.slave: TcpServer | RtuServer | RtuOverTcpServer | None = None
         self.link_info: dict = {"connected": False, "label": "未连接", "mode": "tcp", "unit": 1}
         self.logs: deque = deque(maxlen=800)
         self._log_seq = 0
@@ -162,6 +171,7 @@ class ModbusCore:
         timeout = float(cfg.get("timeout", 2.0))
         unit = int(cfg.get("unit", 1))
 
+        transport: Transport
         if mode == "tcp":
             transport = TcpTransport(cfg.get("host") or "127.0.0.1",
                                      int(cfg.get("port", 502)), timeout=timeout)
@@ -310,6 +320,7 @@ class ModbusCore:
         fc = int(fc)
         address, _area = self._resolve_address(fc, address, address_mode)
 
+        payload: list[bool] | list[int]
         if fc in (5, 15):
             payload = [bool(v) for v in values]
         elif fc == 22:
@@ -489,6 +500,7 @@ class ModbusCore:
         identity = {int(k): str(v)
                     for k, v in (cfg.get("identity") or {}).items()} or None
         mode = cfg.get("mode", "tcp")
+        server: TcpServer | RtuServer
         if mode in ("tcp", "rtutcp"):
             # rtutcp：TCP 监听但流里跑裸 RTU 帧，模拟串口服务器/DTU 背后的设备
             server_cls = TcpServer if mode == "tcp" else RtuOverTcpServer
@@ -672,7 +684,7 @@ class ModbusCore:
 
     def state(self) -> dict:
         with self._lock:
-            stats = {"requests": 0, "errors": 0, "latency": None}
+            stats: dict[str, Any] = {"requests": 0, "errors": 0, "latency": None}
             if self.client is not None:
                 stats = {
                     "requests": self.client.request_count,

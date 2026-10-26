@@ -125,14 +125,16 @@ WRITE_SINGLE_FC = (FC.WRITE_SINGLE_COIL, FC.WRITE_SINGLE_REGISTER)
 # 各功能码单帧能带的最大数量。客户端打包要用它做前置校验，
 # 从站分发也要用它拦超规请求 —— 只在一边校验的话，第三方主站发
 # 200 个寄存器过来，从站会拼出一个 400 字节的应答（字节数字段存不下）。
-READ_LIMIT = {
+# 键按 int 标注：调用侧拿到的是 int(功能码)，FC 是 IntEnum，往 int 键的
+# dict 里放/取都成立 —— 标成 dict[FC, int] 反而逼所有调用方去构造 FC。
+READ_LIMIT: dict[int, int] = {
     FC.READ_COILS: MAX_READ_BITS,
     FC.READ_DISCRETE_INPUTS: MAX_READ_BITS,
     FC.READ_HOLDING_REGISTERS: MAX_READ_REGS,
     FC.READ_INPUT_REGISTERS: MAX_READ_REGS,
 }
 
-WRITE_LIMIT = {
+WRITE_LIMIT: dict[int, int] = {
     FC.WRITE_SINGLE_COIL: 1,
     FC.WRITE_SINGLE_REGISTER: 1,
     FC.WRITE_MULTIPLE_COILS: MAX_WRITE_BITS,

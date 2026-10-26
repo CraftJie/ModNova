@@ -261,6 +261,7 @@ def cmd_serve(args) -> int:
     for index, value in enumerate(init_values):
         store.set("holding_registers", index, value)
 
+    server: TcpServer | RtuServer
     if args.tcp:
         host, port = _parse_endpoint(args.tcp, 502)
         server = TcpServer(host=host, port=port, store=store, unit=args.unit, on_log=print)

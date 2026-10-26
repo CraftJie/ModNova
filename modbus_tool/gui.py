@@ -24,6 +24,7 @@ import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
+from typing import Literal
 
 from .addressing import AddressError, area_of_fc, display_address, resolve_address
 from .applog import install_excepthook
@@ -35,6 +36,7 @@ from .codec import (
     as_signed16,
     bin_of,
     decode,
+    decode_ascii,
     encode,
     format_value,
     hex_of,
@@ -120,6 +122,10 @@ from .ui_theme import (
 
 # 连接浮层里标签列的固定宽度：TCP/RTU 两套字段靠它对齐
 POP_LABEL_W = 56
+
+# ttk 的 heading()/column() 只认这九个 anchor 字面量。列定义写成表的时候
+# 显式标住，否则 mypy 只看到 str，会判定「没有匹配的重载」。
+Anchor = Literal["nw", "n", "ne", "w", "center", "e", "sw", "s", "se"]
 
 # 工具条上的一排按钮统一这个宽度（原来是 ttk 的 11 字符最小宽，
 # 换成自绘后按字数自适应，4 字按钮会比 2 字按钮窄一截）
@@ -234,11 +240,11 @@ class ModbusApp:
         self.config = Config()
 
         self.client: ModbusClient | None = None
-        self.server = None
+        self.server: TcpServer | RtuServer | RtuOverTcpServer | None = None
         # -- 双视图状态：True = 概览（Modbus Poll 式网格，默认），False = 明细 --
         self._master_grid = True
         self._slave_grid = True
-        self._last_read = None            # 最近一次读到的原始数据，切换视图时重画用
+        self._last_read: tuple[list, int] | None = None   # 最近一次读到的原始数据，切换视图时重画用
         self._slave_grid_per = 10         # 网格每行格数（随格式变化，双击定位地址用）
         self._slave_grid_pad = 0          # 首行左侧留空几格（行首对齐用）
         self._slave_base = 0              # 网格行首基准（per 的整数倍）
@@ -262,7 +268,7 @@ class ModbusApp:
         self._log_lines = 0
         self._log_paused = False
         self._log_held: list[tuple[str, str]] = []   # 暂停期间的条目缓存，恢复时补记
-        self._slave_sig = None          # 上一次从站表格的内容指纹，用来跳过无变化的刷新
+        self._slave_sig: tuple | None = None   # 上一次从站表格的内容指纹，用来跳过无变化的刷新
         # -- 链路健康：站号、连续失败次数、状态（on / warn / down）--
         self._link_text = ""            # 例如 "TCP 127.0.0.1:15040"
         self._link_unit = 1
@@ -274,7 +280,7 @@ class ModbusApp:
         # 明细视图上次因超长截断记日志时的点数：轮询每拍都会重画这张表，
         # 只在点数变化时提醒一次，否则每秒两条把通信日志刷没
         self._detail_trunc: int | None = None
-        self._fade_job = None
+        self._fade_job: str | None = None
         # -- 迷你趋势条：选中单元格的历史值 --
         self._trend: collections.deque = collections.deque(maxlen=120)
         self._trend_key: int | None = None
@@ -287,9 +293,9 @@ class ModbusApp:
         # 输入校验要在每次按键时问一句「现在是不是十六进制记法」。
         self._addr_hex = tk.BooleanVar(value=False)
         self.plc_var = tk.BooleanVar(value=False)
-        self._written_span = None       # 刚写过的寄存器范围 (起, 止)，用来框选
+        self._written_span: tuple[int, int] | None = None   # 刚写过的寄存器范围 (起, 止)，用来框选
         self._written_marks: list = []  # 框选框的 4 条边框
-        self._written_job = None        # 框选过期定时器
+        self._written_job: str | None = None   # 框选过期定时器（after 的 id 是字符串）
 
         self._init_style()
         self._build_ui()
@@ -477,7 +483,7 @@ class ModbusApp:
         # 事件在类这一层就被 break 掉，到不了全局绑定。
         self.root.bind_all("<Control-Key-1>", lambda e: self.tabs.select(0))
         self.root.bind_all("<Control-Key-2>", lambda e: self.tabs.select(1))
-        self.root.bind_all("<F6>", lambda e: self.tabs.select(1 - self.tabs.index))
+        self.root.bind_all("<F6>", lambda e: self.tabs.select(1 - self.tabs.active_index))
         # 现场是左手键盘右手鼠标：切页、停轮询、手动补读都该有键可用，
         # 不必每次把手从键盘挪到鼠标上点按钮
         self.root.bind_all("<F5>", lambda e: self._run_primary())
@@ -499,7 +505,7 @@ class ModbusApp:
         从站页看不见的主站状态栏，已连接时更是后台真发一帧读。从站页的
         F5 语义就应该是刷新从站表格；没起从站或没变化时它自然空转。
         """
-        if self.tabs.index == 1:
+        if self.tabs.active_index == 1:
             self._refresh_slave_table()
             return "break"
         if self._current_fc() in (1, 2, 3, 4):
@@ -927,7 +933,7 @@ class ModbusApp:
 
     def _open_conn_popover(self) -> None:
         """贴着按钮下沿右对齐浮出 —— 位置跟按钮走，不跟窗口走。"""
-        if self.tabs.index != 0:
+        if self.tabs.active_index != 0:
             return
         pop = self.conn_popover
         pop.update_idletasks()
@@ -985,9 +991,9 @@ class ModbusApp:
         - 浮层：连上了、或者切到从站页，都必须收起来 —— 一个浮在别的
           页签上的连接表单比任何布局问题都更让人困惑。
         """
-        if self.tabs.index != 0 or self.client is not None:
+        if self.tabs.active_index != 0 or self.client is not None:
             self._close_conn_popover()
-        if self.tabs.index == 0:
+        if self.tabs.active_index == 0:
             self.led.pack(side="right", padx=(0, SP_L))
             connected = self.client is not None
             self.connect_btn.configure(
@@ -1109,13 +1115,14 @@ class ModbusApp:
         self.detail_wrap.columnconfigure(0, weight=1)
         columns = ("seq", "addr", "dec", "hex", "bin")
         self.result_tree = ttk.Treeview(self.detail_wrap, columns=columns, show="headings", height=12)
-        for key, text, width, anchor in (
+        column_specs: tuple[tuple[str, str, int, Anchor], ...] = (
             ("seq", "#", 40, "center"),
             ("addr", "地址", 104, "center"),
             ("dec", FMT_VALUE, 160, "e"),
             ("hex", FMT_HEX, 140, "e"),
             ("bin", FMT_BIN, 320, "w"),
-        ):
+        )
+        for key, text, width, anchor in column_specs:
             # 表头对齐必须跟数据列一致（数值/十六进制是右对齐），否则表头飘在左边、数据贴在右边
             self.result_tree.heading(key, text=text, anchor=anchor)
             self.result_tree.column(key, width=width, anchor=anchor, stretch=(key == "bin"))
@@ -1728,7 +1735,7 @@ class ModbusApp:
         fault.pack(fill="x")
         fault.columnconfigure(1, weight=1)
         fault.columnconfigure(3, weight=1)
-        self._fault_labels = {}           # 字段名 → 标题标签；CRC 字段禁用时要连标题一起变灰
+        self._fault_labels: dict[str, ttk.Label] = {}   # 字段名 → 标题标签；CRC 字段禁用时要连标题一起变灰
 
         def fault_field(row: int, col: int, label: str, initial: str,
                         maximum: int, width: int = 6):
@@ -1802,12 +1809,13 @@ class ModbusApp:
         self.slave_tree = ttk.Treeview(
             self.slave_detail_wrap, columns=("addr", "dec", "hex", "bin"),
             show="headings", height=16)
-        for key, text, width, anchor in (
+        column_specs: tuple[tuple[str, str, int, Anchor], ...] = (
             ("addr", "地址", 80, "center"),
             ("dec", FMT_VALUE, 120, "e"),
             ("hex", FMT_HEX, 98, "e"),
             ("bin", FMT_BIN, 220, "w"),
-        ):
+        )
+        for key, text, width, anchor in column_specs:
             self.slave_tree.heading(key, text=text, anchor=anchor)
             self.slave_tree.column(key, width=width, anchor=anchor, stretch=(key == "bin"))
         self.slave_tree.grid(row=0, column=0, sticky="nsew")
@@ -2797,28 +2805,37 @@ class ModbusApp:
             self._set_status_extra(label, "")
             return
         values, _ = self._last_read
-        text = "".join(decode(values, "ascii", self.byteorder_box.get() or "ABCD"))
+        text = "".join(decode_ascii(values, self.byteorder_box.get() or "ABCD"))
         text = text.rstrip(NONPRINT)
         self._set_status_extra(label, f'"{text}"' if text else "")
 
-    def _set_status_extra(self, label, text: str) -> None:
+    def _set_status_extra(self, label: ttk.Label | None, text: str) -> None:
         """状态栏里那两段可选提示（光标定位 / ASCII 预览）：有内容才露出来。
 
         空 Label 也占着几像素白底，和左边的连接状态并排看就像三道没有任何
         含义的白条 —— 用户确实问过「左下角这三个白条是干什么的」。
         没内容时收起，有内容时按固定顺序（状态 → 光标 → ASCII）补回去。
         """
+        if label is None:
+            return
         label.configure(text=text)
-        if text:
-            if not label.winfo_manager():
-                if label is getattr(self, "cursor_label", None) and \
-                        getattr(self, "ascii_label", None) is not None and \
-                        self.ascii_label.winfo_manager():
-                    label.pack(side="left", padx=(16, 0), before=self.ascii_label)
-                else:
-                    label.pack(side="left", padx=(16, 0))
-        elif label.winfo_manager():
-            label.pack_forget()
+        if not text:
+            if label.winfo_manager():
+                label.pack_forget()
+            return
+        if label.winfo_manager():
+            return
+        # 光标提示要插在 ASCII 预览左边：两段提示的固定顺序就是 状态 → 光标 → ASCII
+        cursor_label = getattr(self, "cursor_label", None)
+        ascii_label = getattr(self, "ascii_label", None)
+        # 先 isinstance 再比身份：直接拿 Any|None 的 getattr 结果去 is 比较，
+        # 类型收窄会把 label 也拉回 Any|None，后面的 pack 就没法查了
+        if (isinstance(cursor_label, ttk.Label) and cursor_label is label
+                and isinstance(ascii_label, ttk.Label)
+                and ascii_label.winfo_manager()):
+            label.pack(side="left", padx=(16, 0), before=ascii_label)
+        else:
+            label.pack(side="left", padx=(16, 0))
 
     # -- 写入范围框选 -----------------------------------------------------
 
@@ -3219,6 +3236,8 @@ class ModbusApp:
         if hit is None:
             return
         _, key = hit
+        if self._last_read is None:
+            return
         values, address = self._last_read
         if address <= key < address + len(values):
             self._set_trend_key(key)
@@ -3412,6 +3431,7 @@ class ModbusApp:
                 # 整数必须先走整数解析：`float(text)` 只有 53 位尾数，
                 # 就地改 uint64/int64 会把低位静默改掉（codec.encode 里
                 # 特意绕开了 float，这里再转一次等于把防护绕过去）。
+                raw_value: int | float
                 if is_integer(dtype):
                     raw_value = _parse_int(text)
                 else:
@@ -4118,11 +4138,13 @@ class ModbusApp:
     @staticmethod
     def _local_ips() -> list[str]:
         """给报错文案列本机可用地址；枚举不到就只剩 127.0.0.1。"""
-        ips = {"127.0.0.1"}
+        ips: set[str] = {"127.0.0.1"}
         try:
             for info in socket.getaddrinfo(socket.gethostname(), None,
                                            socket.AF_INET):
-                ips.add(info[4][0])
+                addr = info[4][0]
+                if isinstance(addr, str):    # 桩里这个元组元素是 str | int
+                    ips.add(addr)
         except OSError:
             pass
         return sorted(ips)
@@ -4523,6 +4545,7 @@ class ModbusApp:
         area = self._current_area()
         store = self.server.store
         try:
+            value: bool | int
             if area in BIT_AREAS:
                 value = text.lower() in ("1", "on", "true", "yes", "●")
             elif fmt == FMT_HEX:

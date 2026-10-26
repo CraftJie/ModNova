@@ -29,6 +29,7 @@ import struct
 import threading
 import time
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 from .crc import append_crc, verify_crc
 
@@ -239,8 +240,14 @@ class _RtuFrameMixin:
     抽成混入而不是复制一份，两边的帧边界判断才不会各自漂移。
 
     注意混入**不定义** `_read_exact`：桩方法会遮蔽 MRO 里 TcpTransport
-    的同名实现（RtuOverTcpTransport 直接继承 socket 版）。
+    的同名实现（RtuOverTcpTransport 直接继承 socket 版）。所以这两个宿主
+    提供的原语只在类型检查期声明 —— 让 mypy 认得，运行期一个字节都不多。
     """
+
+    if TYPE_CHECKING:
+        def _read_exact(self, size: int) -> bytes: ...
+
+        def _emit(self, direction: str, unit: int, frame: bytes) -> None: ...
 
     def _read_rtu_device_id_frame(self, head: bytes) -> bytes:
         """FC 0x2B 的应答是变长对象列表：MEI/读码/一致性/后续标志/下一个对象/对象数，

@@ -263,7 +263,12 @@ class SegmentedTabs(tk.Canvas):
         self._animate_to(target_x, target_w, old)
 
     @property
-    def index(self) -> int:
+    def active_index(self) -> int:
+        """当前选中段。
+
+        刻意不叫 `index`：Canvas 自己有个 `index()` 方法（把 item 标识换成
+        序号），同名属性会把它整个盖掉 —— 现在没人调，但那是留给未来的坑。
+        """
         return self._index
 
     # ---------------------------------------------------------------- 动画

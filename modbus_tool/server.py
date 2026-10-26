@@ -15,6 +15,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from . import __version__ as _VERSION
 from .crc import append_crc, verify_crc
@@ -482,7 +483,9 @@ class RtuServer:
         self.stopbits = stopbits
         self.core = ModbusServer(store, unit, identity, faults)
         self.on_log = on_log
-        self._ser = None
+        # pyserial 是可选依赖（HAS_SERIAL 为假时整个类都建不起来），
+        # 类型上也就不去引 serial 的名字，标成 Any 省得每个调用点都在猜
+        self._ser: Any = None
         self._thread: threading.Thread | None = None
         self._running = threading.Event()
 
@@ -537,9 +540,12 @@ class RtuServer:
         self._log("RTU 从站已停止")
 
     def _read_exact(self, size: int) -> bytes | None:
+        ser = self._ser
+        if ser is None:                 # 停止过程中被清掉：当作没读到
+            return None
         buf = bytearray()
         while len(buf) < size and self._running.is_set():
-            chunk = self._ser.read(size - len(buf))
+            chunk = ser.read(size - len(buf))
             if not chunk:
                 return None
             buf += chunk
@@ -552,8 +558,11 @@ class RtuServer:
         那些字节会被当成下一帧的帧头，之后每帧都错位，直到总线彻底静默。
         """
         self._log(f"丢弃无法识别的请求（{reason}），重新同步")
+        ser = self._ser
+        if ser is None:
+            return
         try:
-            self._ser.reset_input_buffer()
+            ser.reset_input_buffer()
         except Exception:
             pass
 
@@ -592,10 +601,13 @@ class RtuServer:
                 response = self.core.handle_pdu(frame[1:-2])
                 if response is None:
                     continue          # 注入的不响应
+                ser = self._ser
+                if ser is None:     # 停止时清空，不必再写
+                    break
                 try:
                     out = self.core.maybe_corrupt(append_crc(bytes([unit]) + response))
-                    self._ser.write(out)
-                    self._ser.flush()
+                    ser.write(out)
+                    ser.flush()
                 except Exception as exc:
                     self._log(f"串口写入失败 —— {exc}")
                     break

@@ -220,12 +220,14 @@ def _pdu_lines(pdu: bytes) -> list[str]:
                     if pos + 2 > len(body):
                         break
                     oid, length = body[pos], body[pos + 1]
-                    value = body[pos + 2:pos + 2 + length]
+                    # 这里叫 chunk 而不是 value：同一函数上方 value 是整数，
+                    # 复用同名变量会让类型检查（和读代码的人）都以为它是 int
+                    chunk = body[pos + 2:pos + 2 + length]
                     label = DEVICE_ID_OBJECTS.get(oid, f"对象 {oid}")
                     try:
-                        shown = value.decode("ascii")
+                        shown = chunk.decode("ascii")
                     except UnicodeDecodeError:
-                        shown = value.hex(" ")
+                        shown = chunk.hex(" ")
                     lines.append(f"  对象 {oid}（{label}）= {shown!r}（{length} 字节）")
                     pos += 2 + length
     elif fc in READ_FCS and len(body) >= 2 and body[0] == len(body) - 1:
