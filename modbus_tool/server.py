@@ -389,8 +389,12 @@ class TcpServer:
                 # 空闲约 30 秒后开始探测，几十秒内把死连接收走。
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 if hasattr(socket, "SIO_KEEPALIVE_VALS"):       # Windows：默认要等 2 小时
+                    # ioctl 只有 Windows 版 socket 才有，getattr 取一次：
+                    # 直接写 conn.ioctl 在 Linux 的 CI 上过不了类型检查
+                    ioctl = getattr(conn, "ioctl", None)
                     try:
-                        conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30_000, 3_000))
+                        if ioctl is not None:
+                            ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30_000, 3_000))
                     except OSError:
                         pass
                 elif hasattr(socket, "TCP_KEEPIDLE"):           # Linux/macOS

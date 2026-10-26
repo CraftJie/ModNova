@@ -4609,9 +4609,12 @@ class ModbusApp:
 
 def main() -> None:
     try:  # Windows 高 DPI，避免界面被系统放大后发虚
-        from ctypes import windll
+        import ctypes
 
-        windll.shcore.SetProcessDpiAwareness(1)
+        # windll 只有 Windows 才有；CI 的 lint 跑在 Linux 上，用 getattr 取
+        windll = getattr(ctypes, "windll", None)
+        if windll is not None:
+            windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
 

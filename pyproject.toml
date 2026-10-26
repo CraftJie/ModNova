@@ -44,7 +44,9 @@ ignore = [
 "tests/*.py" = ["E402"]
 
 [tool.mypy]
-python_version = "3.9"
+# mypy 已经不再支持 3.9（会直接警告），退到 3.10；真正保证 3.9 兼容的是
+# CI 里那一组 python 3.9 的逻辑测试
+python_version = "3.10"
 warn_unused_ignores = true
 warn_redundant_casts = true
 # pyserial 是可选依赖，没有类型存根；没有它时 HAS_SERIAL 为 False
