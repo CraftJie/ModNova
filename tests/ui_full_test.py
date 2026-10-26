@@ -520,18 +520,33 @@ class Runner:
         self.case("B 链路", "连接被拒绝", "LED 显示失败、按钮回到「连接」", refused)
 
         def rtu_without_serial():
+            """RTU 连接：缺 pyserial 要说清楚；装了 pyserial 也不许去开真串口。
+
+            2026-10-25 回归：这条用例原来拿控件里的默认端口名（COM1）去连。
+            装了 pyserial 的机器上 —— 开发机的板载串口、CI 的 Azure runner
+            的串口控制台都是 COM1 —— 会**真的把 COM1 打开并连上**，而用例
+            结束时没有断开。接着「D 自环」的第一次点击就变成了「断开」，
+            LED 停在「已断开」，后面整串用例连锁失败（症状全是「尚未连接」）。
+            现在统一填一个不可能存在的端口名：缺 pyserial 报缺依赖，有
+            pyserial 报端口打不开，两种环境都不会留下活着的连接。
+            """
             app.link_mode.set("rtu")
             app._on_link_mode_change()
             self.pump(0.15)
+            self.set_entry(app.rtu_port, "COM256")
             app._toggle_connection()
-            self.pump(0.4)
+            no_client = self.wait(lambda: app.client is None, timeout=6)
+            self.pump(0.3)
             text = self.status()
             app.link_mode.set("tcp")
             app._on_link_mode_change()
             self.pump(0.15)
-            if HAS_SERIAL:
-                return f"已装 pyserial，状态={text}", "pyserial" not in text
-            return f"状态={text}", "pyserial" in text
+            if app.client is not None:          # 兜底：真连上了也必须断开
+                app._toggle_connection()
+                self.wait(lambda: app.client is None, timeout=5)
+            if not HAS_SERIAL:
+                return f"状态={text}", "pyserial" in text
+            return f"状态={text} 未连上={no_client}", no_client and "失败" in text
 
         self.case("B 链路", "RTU 连接（无 pyserial）", "明确提示需要 pyserial", rtu_without_serial)
 
@@ -963,6 +978,12 @@ class Runner:
         app.server.store.set("discrete_inputs", 0, True)
 
         def connect_master():
+            # 自环用例的前提是「还没连」。前面的串口用例万一真打开了一个
+            # 端口（装了 pyserial 且机器上确实有这个口），这里必须先断开，
+            # 否则 _toggle_connection 会走「断开」分支，整组用例全部误报。
+            if app.client is not None:
+                app._toggle_connection()
+                self.wait(lambda: app.client is None, timeout=5)
             app.tabs.select(0)
             self.pump(0.25)
             self.log_clear_and_wait()
